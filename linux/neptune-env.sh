@@ -5,7 +5,7 @@
 # 2026-11-25c, Series X path, 16 GB card), plus what Proton needs, then runs
 # the rest of the line. Set GAME_DIR to the game folder as Wine sees it.
 
-: "${GAME_DIR:=Z:\\mnt\\fast\\GTA6.Xbox.v1.0.2.1-CYBERLEEK}"
+: "${GAME_DIR:?set GAME_DIR to the game folder as Wine sees it, e.g. Z:\\games\\title}"
 
 export VICTORY_GAME_DIR="$GAME_DIR"
 export VICTORY_DISCORD=0
@@ -48,10 +48,10 @@ export VICTORY_DESC_DATA=1
 export VICTORY_VRAM_IDLE_MS=15000,2500,1000
 export VICTORY_PIPELINE_WAIT_MS=2500
 
-# Proton on this machine
+# Proton (NVIDIA: NV_CACHE=<dir> for the driver's shader cache)
 export WINEDLLOVERRIDES="d3dcompiler_47=n"
 export VKD3D_CONFIG=no_upload_hvv
-export __GL_SHADER_DISK_CACHE_PATH=/mnt/fast/nvidia-cache
+[ -n "${NV_CACHE:-}" ] && export __GL_SHADER_DISK_CACHE_PATH="$NV_CACHE"
 export __GL_SHADER_DISK_CACHE_SIZE=10737418240
 export __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
 export PROTON_ENABLE_WAYLAND=1
