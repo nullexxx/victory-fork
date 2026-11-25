@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -169,10 +170,18 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs);
+            #[cfg(windows)]
+            {
+                if let Some(file) = warm {
+                    return translate::warm(paths, &file, jobs);
+                }
+                translate::run(paths, validate, pipelines, list, jobs)
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            #[cfg(not(windows))]
+            {
+                let _ = (paths, validate, pipelines, list, jobs, warm);
+                anyhow::bail!("translate checks shaders against the host's D3D12 and needs Windows")
+            }
         }
         Command::Run {
             exe,

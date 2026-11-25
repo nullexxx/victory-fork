@@ -23,6 +23,7 @@
 
 #[cfg(windows)]
 mod console_insn;
+#[cfg(windows)]
 mod crash;
 pub mod prepare;
 pub mod resolve;

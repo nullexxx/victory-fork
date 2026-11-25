@@ -31,3 +31,16 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+
+  # The platform-level crates (shader translator, formats, PE reader, HLE
+  # logic) build and test off Windows; this keeps them that way. Running a
+  # title still needs Windows (or Wine/Proton with vkd3d-proton).
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --workspace --locked

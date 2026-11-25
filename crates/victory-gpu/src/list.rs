@@ -1812,6 +1812,7 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// A GPU wait for a memory value: the list's commands after it run when
 /// the 32 or 64 bits at `address` compare as asked with `reference`.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))] // off Windows every wait is met
 pub(crate) struct ValueWait {
     address: u64,
     comparison: u32,
@@ -1850,6 +1851,13 @@ impl ValueWait {
         met
     }
 
+    /// Off Windows no title memory is mapped, so every wait counts as met.
+    #[cfg(not(windows))]
+    fn holds(&self) -> bool {
+        true
+    }
+
+    #[cfg(windows)]
     fn holds(&self) -> bool {
         let bytes = if self.wide { 8 } else { 4 };
         if self.address == 0 {
@@ -1877,6 +1885,7 @@ impl ValueWait {
 
     /// Whether the wait is met with `value` at its address (its low half
     /// for a 32-bit wait).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn holds_for(&self, value: u64) -> bool {
         let (value, reference) = if self.wide {
             (value, self.reference)
@@ -1907,6 +1916,7 @@ static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex
 /// buffer and nothing was lit).
 /// shortcut: a wait holds its whole list (and submission) back, not only
 /// the commands after it.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
     let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let mut unmet = Vec::new();

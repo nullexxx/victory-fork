@@ -614,6 +614,7 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     // First: a view of no resource (a typed null view) has none.
     let host = host_resource(this)?;
@@ -2550,6 +2551,7 @@ static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// See [`PLACED_TWINS`].
 #[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] // read by the diagnostics log
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }
