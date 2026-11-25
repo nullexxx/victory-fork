@@ -10,10 +10,47 @@ set -euo pipefail
 TAG=GE-Proton11-14
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=${WORK:-$HOME/.cache/wineserver-view-tree}
-GE=${1:-$HOME/.steam/root/compatibilitytools.d/$TAG}
-OUT=${OUT:-$HOME/.steam/root/compatibilitytools.d/$TAG-viewtree}
 
-[ -x "$GE/files/bin/wineserver" ] || { echo "no $GE/files/bin/wineserver: pass the GE-Proton folder"; exit 1; }
+# Where GE-Proton11-14 is: the argument, or the usual places for Steam's
+# compatibility tools (native Steam, Flatpak Steam, system packages).
+find_ge() {
+    local d
+    for d in \
+        "$HOME/.steam/root/compatibilitytools.d" \
+        "$HOME/.steam/steam/compatibilitytools.d" \
+        "$HOME/.local/share/Steam/compatibilitytools.d" \
+        "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d" \
+        /usr/share/steam/compatibilitytools.d \
+        /usr/local/share/steam/compatibilitytools.d; do
+        [ -d "$d" ] || continue
+        for g in "$d"/*/; do
+            g=${g%/}
+            case "$g" in *-viewtree) continue ;; esac
+            if [ -x "$g/files/bin/wineserver" ] && grep -qs "$TAG" "$g/version" "$g/compatibilitytool.vdf"; then
+                echo "$g"; return
+            fi
+        done
+    done
+}
+GE=${1:-$(find_ge)}
+[ -n "$GE" ] && [ -x "$GE/files/bin/wineserver" ] || {
+    echo "could not find $TAG. Pass its folder: bash build.sh /path/to/$TAG"
+    exit 1
+}
+grep -qs "$TAG" "$GE/version" || echo "warning: $GE/version does not say $TAG; the server must match that Proton exactly"
+echo "using $GE"
+
+# The copy goes in the user's own compatibility tools folder, beside Steam's.
+if [ -z "${OUT:-}" ]; then
+    case "$GE" in
+        "$HOME"/*) OUT=$(dirname "$GE")/$TAG-viewtree ;;
+        *) for d in "$HOME/.steam/root" "$HOME/.local/share/Steam"; do
+               [ -d "$d" ] && { OUT=$d/compatibilitytools.d/$TAG-viewtree; break; }
+           done ;;
+    esac
+fi
+[ -n "${OUT:-}" ] || { echo "no Steam folder found for the copy; set OUT=/path/to/compatibilitytools.d/$TAG-viewtree"; exit 1; }
+mkdir -p "$(dirname "$OUT")"
 
 mkdir -p "$WORK" && cd "$WORK"
 if [ ! -d pge ]; then
@@ -52,8 +89,22 @@ strip ../../wineserver
 
 if [ ! -d "$OUT" ]; then
     cp -a "$GE" "$OUT"
-    sed -i "s/\"$TAG\"/\"$TAG-viewtree\"/g" "$OUT/compatibilitytool.vdf"
 fi
+cat > "$OUT/compatibilitytool.vdf" <<VDF
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "$TAG-viewtree"
+    {
+      "install_path" "."
+      "display_name" "$TAG-viewtree"
+      "from_oslist"  "windows"
+      "to_oslist"    "linux"
+    }
+  }
+}
+VDF
 [ -f "$OUT/files/bin/wineserver.ge" ] || cp "$OUT/files/bin/wineserver" "$OUT/files/bin/wineserver.ge"
 install -m755 ../../wineserver "$OUT/files/bin/wineserver"
 echo "done: $OUT (restart Steam, then pick $TAG-viewtree)"
