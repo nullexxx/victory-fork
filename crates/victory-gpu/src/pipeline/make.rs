@@ -367,13 +367,29 @@ fn pipeline_workers() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)))
 }
 
-/// Workers run below normal priority, under the title's own threads;
-/// `VICTORY_PIPELINE_PRIORITY=normal` leaves them at normal. Under Wine a
-/// lower priority is a higher nice value, and a title keeping every core
-/// busy can leave such workers almost no time: a run under Proton made about
-/// one pipeline a second in the world with 1,200 waiting.
+/// Workers run below normal priority, under the title's own threads, but
+/// not under Wine; `VICTORY_PIPELINE_PRIORITY=normal` or `=below` chooses.
+/// Under Wine a lower priority is a higher nice value, and a title keeping
+/// every core busy left such workers almost no time: a run under Proton made
+/// about one pipeline a second in the world with 1,200 waiting and 1,300 to
+/// 2,700 draws a frame dropped; at normal priority (and 12 workers) 7 waited
+/// and about 350 were dropped.
 fn lower_priority() -> bool {
-    std::env::var("VICTORY_PIPELINE_PRIORITY").map_or(true, |v| !v.trim().eq_ignore_ascii_case("normal"))
+    match std::env::var("VICTORY_PIPELINE_PRIORITY") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("normal") => false,
+        Ok(v) if v.trim().eq_ignore_ascii_case("below") => true,
+        _ => !on_wine(),
+    }
+}
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`).
+fn on_wine() -> bool {
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookups with NUL-terminated names.
+    unsafe {
+        GetModuleHandleA(windows::core::s!("ntdll.dll"))
+            .is_ok_and(|ntdll| GetProcAddress(ntdll, windows::core::s!("wine_get_version")).is_some())
+    }
 }
 
 /// Starts the workers on first use ([`pipeline_workers`]).
