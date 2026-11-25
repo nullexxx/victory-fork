@@ -24,6 +24,8 @@
 #[cfg(windows)]
 mod crash;
 pub mod prepare;
+// Used by the Windows loader only; portable, and tested on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
