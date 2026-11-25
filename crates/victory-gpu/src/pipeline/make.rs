@@ -321,8 +321,18 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Workers at work until the title draws a world.
-const MENU_WORKERS: usize = 2;
+/// Workers at work until the title draws a world: 2, or
+/// `VICTORY_MENU_WORKERS=<n>`. More of them get through the early list
+/// (pipelines earlier runs drew with) before the world is entered, where a
+/// pipeline not made in time drops its draws; with 2, a few slow driver
+/// compiles held the whole list up through the menus (a minute without
+/// one pipeline made, under Proton).
+fn menu_workers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_MENU_WORKERS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2)
+    })
+}
 static WORLD: AtomicBool = AtomicBool::new(false);
 
 /// At every present, with the draws run on the host so far: a frame of many
@@ -353,7 +363,7 @@ fn workers() -> bool {
                     loop {
                         // All of them during the intro and the menus starve
                         // the title's threads: frames come unevenly.
-                        while i >= MENU_WORKERS && !WORLD.load(Ordering::Relaxed) {
+                        while i >= menu_workers() && !WORLD.load(Ordering::Relaxed) {
                             std::thread::sleep(Duration::from_millis(50));
                         }
                         next().make();
