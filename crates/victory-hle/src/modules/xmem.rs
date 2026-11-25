@@ -342,7 +342,33 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section of physical pages: its handle, its size in bytes, and under
+/// Wine a view of the whole of it, made at first use ([`Section::whole`]).
+struct Section(HANDLE, usize, std::sync::OnceLock<usize>);
+
+impl Section {
+    /// Under Wine: the address of a view of the whole section, mapped once
+    /// and kept until the section goes. Our own writes into its pages
+    /// (DirectStorage destinations, [`write_physical`], [`page_window`])
+    /// went through a view mapped and unmapped for each request; under Wine
+    /// each map and unmap is a wineserver request that walks every view of
+    /// the process, and the title holds thousands: in a cutscene wineserver
+    /// spent a third of all processor time in `is_valid_view_addr` and
+    /// `req_unmap_view` (perf, GE-Proton 11). `None` elsewhere, or if the
+    /// view cannot be made.
+    fn whole(&self) -> Option<usize> {
+        if !on_wine() {
+            return None;
+        }
+        let at = *self.2.get_or_init(|| {
+            use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+            // SAFETY: a section we own; the view is ours until the section
+            // goes (`Drop`).
+            unsafe { MapViewOfFile(self.0, FILE_MAP_WRITE, 0, 0, self.1) }.Value as usize
+        });
+        (at != 0).then_some(at)
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -351,6 +377,14 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        if let Some(&at) = self.2.get()
+            && at != 0
+        {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            // SAFETY: the whole-section view of ours (`whole`); no `View`
+            // borrows it any more, as each holds the section.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -444,7 +478,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, size, std::sync::OnceLock::new()));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -480,10 +514,14 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 }
 
 /// A view of our own on consecutive slices of one section, committed and
-/// writable, unmapped when dropped.
+/// writable, unmapped when dropped; or, under Wine, a window on the
+/// section's whole view ([`Section::whole`]), which stays.
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    /// The section, while the window on its whole view is used; `None` for
+    /// a view of our own (unmapped when dropped).
+    whole: Option<Arc<Section>>,
 }
 
 impl View {
@@ -491,6 +529,16 @@ impl View {
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        if let Some(base) = slice.section.whole() {
+            // Committed whole under Wine (`SEC_COMMIT`): nothing to commit.
+            return Some(View {
+                at: MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: (base + offset as usize) as *mut c_void,
+                },
+                len,
+                whole: Some(slice.section.clone()),
+            });
+        }
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
@@ -504,7 +552,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        let view = View { at, len, whole: None };
         commit(at.Value as usize, len).then_some(view)
     }
 
@@ -519,6 +567,9 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        if self.whole.is_some() {
+            return;
+        }
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(self.at) };
     }
