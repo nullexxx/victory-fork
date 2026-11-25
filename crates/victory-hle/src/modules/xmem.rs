@@ -522,6 +522,31 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     1
 }
 
+/// Views mapped and unmapped, by kind: the title's own mappings of physical
+/// pages (`map_logged`, `unmap`), and our views for writes into them
+/// (`View`): under Wine each is a wineserver request that walks every view
+/// of the process. Said in the log at every power of two from 1,024 on.
+static VIEW_CALLS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+const TITLE_MAPS: usize = 0;
+const TITLE_UNMAPS: usize = 1;
+const OWN_MAPS: usize = 2;
+const WHOLE_WINDOWS: usize = 3;
+
+fn count_view_call(kind: usize, live: Option<usize>) {
+    let n = VIEW_CALLS[kind].fetch_add(1, Ordering::Relaxed) + 1;
+    if n >= 1024 && n.is_power_of_two() {
+        let [maps, unmaps, own, whole] = [0, 1, 2, 3].map(|k| VIEW_CALLS[k].load(Ordering::Relaxed));
+        tracing::info!(
+            title_maps = maps,
+            title_unmaps = unmaps,
+            own_views_mapped_and_unmapped = own,
+            writes_through_whole_section_views = whole,
+            title_views_live = live,
+            "physical page views so far (each map or unmap of a view is a wineserver request under Wine)"
+        );
+    }
+}
+
 /// A view of our own on consecutive slices of one section, committed and
 /// writable, unmapped when dropped; or, under Wine, a window on the
 /// section's whole view ([`Section::whole`]), which stays.
@@ -539,6 +564,7 @@ impl View {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         if let Some(base) = slice.section.whole() {
+            count_view_call(WHOLE_WINDOWS, None);
             // Committed whole under Wine (`SEC_COMMIT`): nothing to commit.
             return Some(View {
                 at: MEMORY_MAPPED_VIEW_ADDRESS {
@@ -561,6 +587,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
+        count_view_call(OWN_MAPS, None);
         let view = View { at, len, whole: None };
         commit(at.Value as usize, len).then_some(view)
     }
@@ -910,6 +937,7 @@ fn map_quiet(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> 
 }
 
 fn map_logged(physical: &mut Physical, base: usize, len: usize, slice: Slice, log: bool) -> bool {
+    count_view_call(TITLE_MAPS, Some(physical.views.len()));
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -1030,6 +1058,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
+        count_view_call(TITLE_UNMAPS, Some(physical.views.len()));
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
