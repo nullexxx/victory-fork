@@ -284,6 +284,7 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
@@ -1524,14 +1525,12 @@ fn now_ms() -> u64 {
 /// this long (and this many presented frames) is given up ([`evict`]).
 /// Two minutes: of the textures given up after 20 s, nine in ten were
 /// read again within a minute (run evict4).
-#[cfg(windows)]
 pub(crate) const IDLE_MS: u64 = 120_000;
 /// Frames as well as time: in slow runs (seconds a frame) 20 s alone cycled
 /// the textures of a cutscene's alternating shots (run evict2), and 30
 /// frames gave up what the menus and loading made (at 30 fps) before the
 /// world read it (run evict3). At 30 fps the idle time decides; slower, the
 /// card's budget does.
-#[cfg(windows)]
 pub(crate) const IDLE_FRAMES: u64 = 300;
 /// A use stamp's frame for "never" (tests).
 #[cfg(windows)]
