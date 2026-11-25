@@ -1,14 +1,12 @@
-# VIctory fork (work in progress)
+<p align="center"><img src="https://github.com/realblastex/flamingo/releases/download/progress-2026-11-25/flamingo-512.png" width="160" alt="Flamingo"></p>
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+# Flamingo
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
-developer or publisher.
+Flamingo is a work-in-progress fork of [victory-fork](https://github.com/fxceless/victory-fork),
+which is itself a fork of [VIctory](https://github.com/Marvisak/VIctory). VIctory is a
+compatibility layer that runs an Xbox Series title natively on Windows from files you supply.
+Flamingo is tuned for one freshly released open-world Xbox Series title, run from a dump of your
+own legally obtained copy, on an NVIDIA RTX 4070.
 
 ## Credits
 
@@ -319,140 +317,142 @@ status section describes upstream, not this fork.
 
 ---
 
-# VIctory
+## Status (2026-11-25)
 
-Runs the title (Xbox Series X|S) natively on Windows, from files
-the user supplies.
-
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
-
-## Status (2026-11-23)
-
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
+Tested on one machine: Windows 11, NVIDIA RTX 4070 12 GB, Series S profile (`--console series-s`).
 
 | Stage | State |
 |-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
+| Boot, menus, start screen | work (30 fps) |
+| Opening cutscene | plays through; faces and hair show a dither pattern, eyes come out white, and much of it is too dark |
+| First gameplay scene | renders with the player in control: **about 14 fps** facing the window; **9-12 fps** turned fully around toward the room, where the card is 80-85% busy; 4 fps for a few seconds while turning, as the room's textures stream in |
+| Shadowed areas | dark: the title's ray-traced bounce light and shadows do not run yet |
+| Geometry, characters | some geometry is missing in the first area and some character assets load wrong; under investigation |
+| Latest tree | victory-fork main is merged in (run 84): the cell window's wire grate now draws, but the frame rate is lower for now (9-10 fps, first measurement with a cold shader cache) and is being worked on |
+| Stability | 15-minute runs end without a device loss |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+<p align="center">
+<img src="https://github.com/realblastex/flamingo/releases/download/progress-2026-11-25/prologue-window.png" width="70%" alt="The first gameplay scene">
+</p>
 
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+Screenshots and the logo are attachments of the
+[progress release](https://github.com/realblastex/flamingo/releases/tag/progress-2026-11-25), not
+files in the tree: the asset policy ([docs/asset-policy.md](docs/asset-policy.md)) keeps
+everything derived from the game out of the repository. Every change and every measured run is
+logged in [FLAMINGO.md](FLAMINGO.md).
 
-What each part does today and what it still needs:
+## What Flamingo adds over victory-fork
 
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
+Flamingo's own work:
 
-## Getting started
+- **Stats overlay** (RivaTuner-style): fps and frame time, frames, draws, CPU, GPU and
+  copy-back time per frame, VRAM, RAM, and a frame-time graph. **F9** shows or hides it.
+  `FLAMINGO_OSD=1` shows it from the start; `FLAMINGO_OSD=0` turns it off.
+  <img src="https://github.com/realblastex/flamingo/releases/download/progress-2026-11-25/stats-overlay.png" alt="Stats overlay">
+- **Discord Rich Presence**: the game's name, menu or world, frame rate and time played.
+- **DualSense support**: a PlayStation 5 controller (and the DualSense Edge), over USB or
+  Bluetooth, is the title's first pad while no Xbox controller is connected. It is read over HID,
+  so Steam Input and DS4Windows are not needed. Buttons map by position (cross is A, circle is B,
+  and so on); Options is Menu, and Create or the touch pad click is View. `FLAMINGO_DUALSENSE=0`
+  turns it off. Rumble and the light bar are not driven yet.
+- **Faster submissions**:
+  - title-memory copies that recover from a fault instead of a kernel call per copy;
+  - table constant views read the buffer's own GPU copy, with no CPU fill and no wait;
+  - host objects are released on a thread of their own;
+  - fewer clock reads per frame.
+- **A lean build**: the launcher build has no diagnostics counters, which is about 9% faster.
+  The `keys` feature keeps the scripted keys for timing runs.
+- **Intro and menu flicker fix**: recently changed guarded textures are hashed at every check.
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+Pull requests merged from victory-fork and VIctory that have not landed upstream yet:
 
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+- victory-fork #665: copy-back fetches go on a copy queue of their own.
+- victory-fork #670: no write-watch asking for known view memory.
+- victory-fork #799: 64 KiB constant-view clamp and translator fixes. The loose-LDS fallback is
+  opt-in here (`VICTORY_WAVE_LDS_LOOSE=1`) because it made the world grainy.
+- victory-fork #812: unmapped view blocks are parked instead of asked about every frame
+  (+1 fps).
+- victory-fork #798: the Series S profile keeps the game's own upscaler instead of FSR 4
+  (+2 fps).
+- victory-fork #823: four refused compute programs run on 32-lane GPUs, and the ray-tracing
+  structure builder has all its pipelines.
 
-```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+- victory-fork #768 (opt-in, `VICTORY_WIDE_TEXTURES=1`): a submission's texture checks run
+  several at a time.
+
+Experiments, all off by default, kept for testing (each has its result in FLAMINGO.md):
+
+- `VICTORY_AMBIENT_STUB=1`, `VICTORY_SHADOWMASK_STUB=1`: stand-ins for the ray-traced lighting
+  passes, ported from [ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort) (GPL-3.0). Here
+  they did not brighten the dark areas.
+- `FLAMINGO_BVH_MISS=1`: every ray-tracing node test misses. The cutscene gets brighter, but one run
+  hung.
+- `FLAMINGO_CARD_FILLS=1`: reads of memory that shaders wrote lately are made on the card. Slower.
+- `VICTORY_AMBIENT=<level>`: after the indirect-light resolve, its output is replaced by a constant
+  (from [Belobug's fork](https://github.com/Belobug/VIctory-Belobug-AMD), GPL-3.0). At 0.6 the
+  opening cutscene washed out grey.
+- `FLAMINGO_QUAD_HELPERS=1`: in pixel shaders, reads of the quad's other lanes reach helper lanes
+  (also from Belobug's fork). Sharper fine detail, about 18% slower.
+
+The full list, with the runs behind each one, is in [FLAMINGO.md](FLAMINGO.md).
+
+## Build and run
+
+You need Rust (stable) and Windows 11.
+
+```
+cargo build --profile diag -p victory
 ```
 
-Run the title:
-
-```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
-```
-
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
-
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
-
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
-
-## Commands
+Run it with the settings this build is tuned for:
 
 ```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
+set VICTORY_NO_WATCHDOG=1
+set VICTORY_PIPELINE_WAIT_MS=24
+set VICTORY_RELAY=1
+set VICTORY_LATE_WAIT=3
+set VICTORY_CARD_BUFFERS_MIN_MB=1
+set VICTORY_CARD_BUFFERS_MB=1024
+set VICTORY_INDIRECT_WINDOW=1
+set VICTORY_SHADER_OPT=0
+set VICTORY_WIDE_MERGE=1
+set FLAMINGO_OSD=1
+target\diag\victory.exe run <path to your dump>\<the title's executable> --execute --console series-s
 ```
 
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
+The first launch after a build translates and compiles shaders for a few minutes. Later launches
+use the cache.
 
-## Debugging
+For Discord Rich Presence, put your own Discord application id in
+`%LOCALAPPDATA%\flamingo\discord_app_id.txt` (FLAMINGO.md has the steps).
+`FLAMINGO_DISCORD=0` turns it off.
 
-A release build has no debugging aids. Build them in with
+## Credits
 
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
-```
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors is the base
+  of everything here: the loader, the runtime services, the Direct3D 12 back end and the shader
+  recompiler. It is licensed GPL-3.0-or-later, and so is this fork.
+- **[victory-fork](https://github.com/fxceless/victory-fork)** by fxceless and its contributors
+  did the world rendering and speed work this tree starts from, plus the merged pull requests
+  above. The fork's own README is in [docs/victory-fork-README.md](docs/victory-fork-README.md).
+- **[victory-amd](https://github.com/myokex/victory-amd)** by myokex has an analysis of the dark
+  shadowed areas that pointed at the missing ray-traced light.
+- **[ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort)** by ZigZagBoi1: the opt-in
+  stand-ins for the ray-traced lighting passes are ported from its VIctory-based runtime
+  (GPL-3.0-or-later).
+- **[Belobug's VIctory fork](https://github.com/Belobug/VIctory-Belobug-AMD)**: the opt-in ambient
+  pass and quad helper reads are ported from it (GPL-3.0).
+- The mesh primitive edge-flag fix came as pull request #1 to this repository, a port of upstream
+  VIctory #1718.
+- **[vx-layer](https://github.com/Geckomacabre/vx-layer)** by Geckomacabre (GPL-3.0): the copy-back
+  of textures that shaders write and the title reads on the CPU (`VICTORY_TEXTURE_BACK`), which
+  keeps boats afloat.
+- Pull request #2 by rafaconvaitis: plain copies recover from guard-page faults.
+- The audio fixes of victory-fork #959 (upstream VIctory's XMA and audio ring fixes).
+- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors (GPL-2.0-only) was used as
+  a reference only. No XCL code is copied here.
+- Flamingo's changes were developed with [Claude Code](https://claude.com/claude-code).
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE).

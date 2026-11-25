@@ -25,6 +25,8 @@ pub(crate) enum C {
     /// Write-watch askings and their time.
     Watches,
     WatchUs,
+    /// Askings of cold page runs left out (`crate::watch`, Flamingo).
+    WatchesSkipped,
     /// Bytes of watched ranges checked, and of those found unchanged.
     Checked,
     Unchanged,
@@ -1098,7 +1100,7 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
-         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
+         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms ({:.0} cold ones left out), {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
@@ -1117,6 +1119,7 @@ pub(crate) fn log(frames: f64) {
         faults as f64 / frames,
         c[C::Watches as usize],
         ms(c[C::WatchUs as usize]),
+        c[C::WatchesSkipped as usize],
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],

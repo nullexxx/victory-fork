@@ -90,6 +90,8 @@ struct Ctx<'a> {
     def: HashMap<Value, (usize, usize)>,
     /// Values an instruction reads, directly or through joins.
     live: HashSet<Value>,
+    /// The values holding a lane mask on some path ([`super::lower::mask_values`]).
+    masks: HashSet<Value>,
     idom: Vec<usize>,
     sections: Vec<HashMap<usize, wave::Section>>,
 }
@@ -225,6 +227,7 @@ impl Ctx<'_> {
             users,
             def,
             live,
+            masks: super::lower::mask_values(p, st),
             idom,
             sections,
         }
@@ -673,7 +676,7 @@ impl Ctx<'_> {
                     || name.starts_with("v_mbcnt")
                     || name.contains("lane")
                     || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || super::lower::reads_mask_as_data(st, inst)
+                    || super::lower::reads_mask_as_data(st, &self.masks, inst)
                     || self.sections[b].iter().any(|(&s, sec)| i >= s && i <= sec.end);
                 if cross {
                     return Err((self.at(u), CROSS));

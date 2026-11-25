@@ -24,6 +24,11 @@ use std::collections::BTreeMap;
 
 use crate::ShaderError;
 
+/// The guest wave's lane index bits for V_READLANE_B32 and V_WRITELANE_B32.
+pub(crate) const fn lane_selector_mask(wave64: bool) -> u32 {
+    if wave64 { 63 } else { 31 }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Encoding {
     Sop2,

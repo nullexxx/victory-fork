@@ -825,6 +825,7 @@ extern "system" fn copy_buffer_region(
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && !crate::shadow::copy_on_card(list, to as u64, from as u64, len)
     {
         list.defer_copy(to, from, len as usize);
     }

@@ -28,6 +28,8 @@ impl FourCC {
     pub const HASH: FourCC = FourCC(*b"HASH");
     pub const ILDB: FourCC = FourCC(*b"ILDB");
     pub const ILDN: FourCC = FourCC(*b"ILDN");
+    /// A precompiled program image ([`crate::fspx`]).
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
 }
 
 impl std::fmt::Debug for FourCC {
@@ -130,7 +132,7 @@ pub(crate) fn u64_at(data: &[u8], at: usize) -> Result<u64, ShaderError> {
 }
 
 /// Builds a container from parts (test helper).
-#[cfg(test)]
+#[cfg(any(test, feature = "synthetic"))]
 pub fn build(parts: &[(FourCC, &[u8])]) -> Vec<u8> {
     let table = HEADER_SIZE + 4 * parts.len();
     let total = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();

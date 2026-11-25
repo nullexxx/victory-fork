@@ -137,6 +137,27 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
+/// `extra` (the scripted keys' stand-in pad) on top of a real pad: its
+/// buttons, and its sticks and triggers where the pad's own are at rest, so
+/// the player's own stick wins while it is held.
+#[cfg_attr(not(any(test, feature = "keys")), allow(dead_code))]
+fn with_extra(mut pad: PadState, extra: PadState) -> PadState {
+    pad.buttons |= extra.buttons;
+    for (own, add) in [
+        (&mut pad.left_trigger, extra.left_trigger),
+        (&mut pad.right_trigger, extra.right_trigger),
+        (&mut pad.left_x, extra.left_x),
+        (&mut pad.left_y, extra.left_y),
+        (&mut pad.right_x, extra.right_x),
+        (&mut pad.right_y, extra.right_y),
+    ] {
+        if add != 0.0 && own.abs() < 0.2 {
+            *own = add;
+        }
+    }
+    pad
+}
+
 #[repr(C)]
 struct Table<const N: usize>([*const (); N]);
 // SAFETY: function addresses only.
@@ -1068,6 +1089,10 @@ pub(crate) fn module() -> HleModule {
 }
 
 /// Host input: XInput pads, the keyboard while our process has focus.
+/// Flamingo: a DualSense as the first pad while no XInput pad is there.
+#[cfg(windows)]
+mod dualsense;
+
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1127,6 +1152,41 @@ mod host {
         }
     }
 
+    /// Flamingo: with no XInput pad in the first slot, a DualSense there
+    /// ([`super::dualsense`]), the scripted keys pressing it as they would
+    /// an XInput pad.
+    fn dualsense_pad(slot: usize) -> Option<PadState> {
+        if slot != 0 {
+            return None;
+        }
+        let r = super::dualsense::latest()?;
+        #[allow(unused_mut)]
+        let mut pad = PadState {
+            buttons: r.buttons,
+            left_trigger: r.left_trigger,
+            right_trigger: r.right_trigger,
+            left_x: r.left_x,
+            left_y: r.left_y,
+            right_x: r.right_x,
+            right_y: r.right_y,
+        };
+        #[cfg(feature = "keys")]
+        add_scripted(&mut pad);
+        Some(pad)
+    }
+
+    /// The scripted keys (`VICTORY_KEYS`) on the first pad, as the stand-in
+    /// pad has them: a run's scripted turn still turns with a real pad (a
+    /// DualSense, an Xbox pad) connected.
+    #[cfg(feature = "keys")]
+    fn add_scripted(pad: &mut PadState) {
+        let keys: Vec<super::KeyState> =
+            scripted().into_iter().map(|virtual_key| super::KeyState { virtual_key, ..Default::default() }).collect();
+        if !keys.is_empty() {
+            *pad = super::with_extra(*pad, super::fallback(&keys));
+        }
+    }
+
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
@@ -1135,13 +1195,13 @@ mod host {
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+                return dualsense_pad(slot);
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
+                return dualsense_pad(slot);
             }
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
@@ -1150,21 +1210,17 @@ mod host {
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
+            #[cfg(feature = "keys")]
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
-                }
+                add_scripted(&mut pad);
             }
             Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
+            #[cfg(feature = "keys")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
+            #[cfg(not(feature = "keys"))]
             let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
@@ -1202,7 +1258,7 @@ mod host {
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
+    #[cfg(feature = "keys")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1306,6 +1362,20 @@ mod tests {
         let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
         hub.poll();
         (hub, host)
+    }
+
+    /// Scripted keys on a real pad: buttons added; a scripted stick only
+    /// where the pad's own stick is at rest.
+    #[test]
+    fn scripted_keys_join_a_real_pad() {
+        let real = PadState { buttons: A, left_x: 0.9, right_x: 0.05, ..Default::default() };
+        let keys = fallback(&[key(b'L'), key(b'D'), key(b'C'), key(0x0D)]);
+        let both = with_extra(real, keys);
+        assert_eq!(both.buttons, A | keys.buttons);
+        assert_eq!(both.right_x, 1.0, "the pad's right stick is at rest: the scripted turn turns");
+        assert_eq!(both.left_x, 0.9, "the player's own stick wins");
+        assert_eq!(both.right_trigger, 1.0);
+        assert_eq!(with_extra(real, PadState::default()), real);
     }
 
     fn key(virtual_key: u8) -> KeyState {

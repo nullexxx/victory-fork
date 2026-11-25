@@ -123,6 +123,29 @@ impl Host {
         }
     }
 
+    /// The device's wave sizes (`WaveLaneCountMin`, `WaveLaneCountMax`); `None` if it does not
+    /// say.
+    pub fn wave_lanes(&self) -> Option<(u32, u32)> {
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a valid out pointer of the feature's own type and size.
+        unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+                .ok()?;
+        }
+        Some((o.WaveLaneCountMin, o.WaveLaneCountMax))
+    }
+
+    /// Whether the device can run waves of `lanes` (a program declaring `WaveSize(lanes)`);
+    /// true when it does not say.
+    pub fn runs_waves_of(&self, lanes: u32) -> bool {
+        self.wave_lanes().is_none_or(|(min, max)| (min..=max).contains(&lanes))
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
@@ -587,6 +610,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         .collect();
     s.m.terminate(b, Term::Ret);
     HostShader {
+        dispatch_x_one: false,
         stage: if pixel {
             crate::native::HwStage::Ps
         } else {

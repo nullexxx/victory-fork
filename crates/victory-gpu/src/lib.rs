@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -33,6 +35,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod heap_pass;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
@@ -43,6 +47,8 @@ mod indirect;
 mod inplace;
 pub mod list;
 pub mod object;
+#[cfg(windows)]
+mod osd;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
@@ -71,13 +77,16 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod texback;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{frame_rate, on_failure};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping,
+    title_memory_written,
     writing as kernel_will_write,
 };

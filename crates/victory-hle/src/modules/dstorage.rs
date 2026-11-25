@@ -370,7 +370,7 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, QueuedRead)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -378,15 +378,15 @@ struct Lane {
 }
 
 // SAFETY: requests point into title memory and our own objects, which stay
-// valid until the title has seen them complete; status arrays count their
-// references atomically.
+// valid until the title has seen them complete; files and status arrays count
+// their references atomically.
 unsafe impl Send for Lane {}
 
 /// A read a worker runs.
 struct Job {
     lane: u64,
     seq: u64,
-    request: Request,
+    read: QueuedRead,
     staging: u64,
 }
 
@@ -506,10 +506,14 @@ fn work(scheduler: &'static Scheduler) {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
+        let mut job = job;
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
-        walls_request(&job.request, &result, started);
+        let result = execute(&job.read);
+        walls_request(&job.read.request, &result, started);
+        // Drop our COM reference on the file before signaling completion and
+        // outside `scheduler.lock()`.
+        job.read.release_file();
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -525,17 +529,17 @@ impl Lanes {
     fn count(&mut self, job: &Job, started: std::time::Instant) {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
-        *bytes += u64::from(job.request.destination_size);
+        *bytes += u64::from(job.read.request.destination_size);
         *busy += started.elapsed();
         #[cfg(windows)]
         {
             use victory_gpu::framelog::{T, add};
             add(T::DiskReads, 1);
-            add(T::DiskBytes, u64::from(job.request.destination_size));
+            add(T::DiskBytes, u64::from(job.read.request.destination_size));
             add(T::DiskUs, started.elapsed().as_micros() as u64);
         }
-        if job.request.options & BCPACK != 0 {
-            self.bcpack.0 += u64::from(job.request.destination_size);
+        if job.read.request.options & BCPACK != 0 {
+            self.bcpack.0 += u64::from(job.read.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
         let since = *self.since.get_or_insert(started);
@@ -572,17 +576,16 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, read) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
-        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
+        let size = u64::from(read.request.destination_size.max(read.request.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
         self.lane_now[class] = lane.clock;
@@ -590,7 +593,7 @@ impl Lanes {
         Some(Job {
             lane: id,
             seq,
-            request,
+            read,
             staging,
         })
     }
@@ -751,8 +754,48 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 const PAGE: usize = 64 * 1024;
 
 enum Command {
-    Read(Request),
+    Read(QueuedRead),
     Status(Status),
+}
+
+/// An enqueued read request, holding a COM reference on its file object (when
+/// not a memory source) and an owned copy of its debug name until completion
+/// or drop.
+struct QueuedRead {
+    request: Request,
+    file: Option<*mut Instance<File>>,
+    name: String,
+}
+
+impl QueuedRead {
+    fn new(mut request: Request) -> Self {
+        let name = text(request.name);
+        request.name = std::ptr::null();
+        let file = if request.options & MEMORY_SOURCE == 0 && !request.source.is_null() {
+            let file = request.source.cast::<Instance<File>>().cast_mut();
+            add_ref_instance(file);
+            Some(file)
+        } else {
+            None
+        };
+        Self {
+            request,
+            file,
+            name,
+        }
+    }
+
+    fn release_file(&mut self) {
+        if let Some(file) = self.file.take() {
+            release(file);
+        }
+    }
+}
+
+impl Drop for QueuedRead {
+    fn drop(&mut self) {
+        self.release_file();
+    }
 }
 
 
@@ -780,7 +823,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    queue(this, Command::Read(QueuedRead::new(request)));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -851,7 +894,8 @@ extern "system" fn close(this: QueueRef) {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(read: &QueuedRead) -> Result<(), HRESULT> {
+    let request = &read.request;
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -861,7 +905,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             destination_size = request.destination_size,
             intermediate_size = request.intermediate_size,
             tag = request.tag,
-            name = text(request.name),
+            name = read.name.as_str(),
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -1086,14 +1130,7 @@ fn into_destination(
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
+    let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
@@ -1161,10 +1198,46 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
+            first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
+            options = format_args!("{:#x}", request.options),
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
     }
+}
+
+/// The page numbers of a destination. The title fills the array after it
+/// enqueued the request (a copy taken then holds zeros, or the numbers of
+/// the array's last use), so it is read when the request runs; a number
+/// that is still zero then is waited for, a tenth of a second at most.
+fn filled(array: *const usize, n: usize) -> Vec<usize> {
+    static LATE: AtomicU64 = AtomicU64::new(0);
+    let read = || -> Vec<usize> {
+        // SAFETY: the title passes a page number per 64 KiB of destination
+        // and keeps the array until the request completes; it may write it
+        // from another thread meanwhile.
+        (0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect()
+    };
+    let mut pages = read();
+    if !pages.contains(&0) {
+        return pages;
+    }
+    let began = std::time::Instant::now();
+    while pages.contains(&0) && began.elapsed() < std::time::Duration::from_millis(100) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        pages = read();
+    }
+    let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+    if late <= 8 || late.is_power_of_two() {
+        tracing::warn!(
+            requests = late,
+            pages = n,
+            waited_ms = began.elapsed().as_millis() as u64,
+            filled = !pages.contains(&0),
+            "dstorage: a request ran before its page array was filled"
+        );
+    }
+    pages
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -1321,6 +1394,20 @@ mod tests {
     }
 
     #[test]
+    fn a_page_array_filled_late_is_waited_for() {
+        let array: &'static [std::sync::atomic::AtomicUsize] = Box::leak(Box::new([std::sync::atomic::AtomicUsize::new(7), std::sync::atomic::AtomicUsize::new(0)]));
+        let title = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            array[1].store(8, Ordering::Release);
+        });
+        assert_eq!(filled(array.as_ptr().cast(), 2), [7, 8]);
+        title.join().unwrap();
+        // One never filled is given up on.
+        array[0].store(0, Ordering::Release);
+        assert_eq!(filled(array.as_ptr().cast(), 2), [0, 8]);
+    }
+
+    #[test]
     fn request_layout_is_the_titles() {
         assert_eq!(size_of::<Request>(), 0x48);
         assert_eq!(std::mem::offset_of!(Request, destination_size), 0x18);
@@ -1469,7 +1556,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(QueuedRead::new(r)));
     }
 
     #[test]

@@ -69,12 +69,14 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        gs: None,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.
     assert_eq!(lowered.nonuniform_handles, 1);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
+        dispatch_x_one: false,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

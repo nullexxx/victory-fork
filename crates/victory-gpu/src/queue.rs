@@ -424,19 +424,18 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
     true
 }
 
-/// Runs what waiting queues hold as far as their fences have been reached
-/// (`all`: all of it), each queue's in the order it was given. Called
-/// where a fence may have moved: after a signal and after a submission (a
-/// list's bottom-of-pipe write may be into a fence), never from inside
-/// one.
+/// Runs what waiting queues hold as far as their fences have been reached,
+/// each queue's in the order it was given. With `force`, bypass waits only
+/// after running all ready work. Called after a signal or a submission
+/// (a list's bottom-of-pipe write may be into a fence), never inside one.
 #[cfg(windows)]
-pub(crate) fn release_held(all: bool) {
-    if !all && behind() {
+pub(crate) fn release_held(force: bool) {
+    if !force && behind() {
         // A thread of ours runs what is free to run ([`behind`]).
         wake();
         return;
     }
-    release_held_now(all);
+    release_held_now(force);
 }
 
 /// Whether a submission is only put in its queue's line by the thread
@@ -669,7 +668,7 @@ fn send_joined(joined: &mut Joined) {
         let sent = JOINED[1].fetch_add(1, Ordering::Relaxed) + 1;
         JOINED[2].fetch_add(order.len() as u64, Ordering::Relaxed);
         JOINED[3].fetch_add(joined.signals.len() as u64, Ordering::Relaxed);
-        if sent % 2048 == 0 {
+        if sent.is_multiple_of(2048) {
             let n: Vec<u64> = JOINED.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
             tracing::info!(
                 "parts joined (VICTORY_JOIN_PARTS=1): {} parts went to the host in {} submissions ({:.1} parts, {:.1} lists each), {} signals delivered behind them, {} waits passed for a write of a part not sent yet",
@@ -718,13 +717,14 @@ pub(crate) fn before_sync() {
 }
 
 #[cfg(windows)]
-fn release_held_now(all: bool) {
+fn release_held_now(force: bool) {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
     let _one = lock(&RELEASING);
+    let mut forcing = false;
     let was_here = RELEASING_HERE.replace(true);
     struct Leave(bool);
     impl Drop for Leave {
@@ -735,10 +735,13 @@ fn release_held_now(all: bool) {
     let _leave = Leave(was_here);
     // Parts taken and not sent yet ([`join_parts`]): none when the lines
     // are forced, and none is left when this returns.
-    let joining = !all && behind() && crate::host::late() && crate::host::host().is_some() && join_parts();
+    let joining = !force && behind() && crate::host::late() && crate::host::host().is_some() && join_parts();
     let mut joined = Joined::default();
     loop {
         let queues = lock(&WAITING).clone();
+        if queues.is_empty() {
+            break;
+        }
         let mut moved = false;
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
@@ -751,14 +754,14 @@ fn release_held_now(all: bool) {
                 match held.get(base) {
                     None | Some(Held::Running) => break,
                     Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                        if !forcing && crate::fence::completed(fence as This) < value =>
                     {
                         break;
                     }
                     // With parts taken and not sent: only what is known
                     // without a wait for the card. A wait that stays is
                     // looked at again when the parts have been sent.
-                    Some(Held::Value(wait)) if !all && !joined.is_empty() => {
+                    Some(Held::Value(wait)) if !forcing && !joined.is_empty() => {
                         if !wait.met() && !crate::host::late_met_known(wait) {
                             if !joined.meets(wait) {
                                 break;
@@ -766,7 +769,7 @@ fn release_held_now(all: bool) {
                             JOINED[4].fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    Some(Held::Value(wait)) if !forcing && !value_met(wait) => break,
                     // The frame is shown behind the parts taken: they are
                     // sent first.
                     Some(Held::Present(..)) if !joined.is_empty() => break,
@@ -777,7 +780,7 @@ fn release_held_now(all: bool) {
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
-                        if all && !value_met(&wait) {
+                        if forcing && !value_met(&wait) {
                             static SEEN: AtomicU64 = AtomicU64::new(0);
                             if SEEN.fetch_add(1, Ordering::Relaxed) < 16 {
                                 tracing::warn!(
@@ -792,7 +795,7 @@ fn release_held_now(all: bool) {
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
-                                "RUN held submission of {} lists (forced {all})",
+                                "RUN held submission of {} lists (forced {forcing})",
                                 order.len()
                             )
                         });
@@ -831,7 +834,7 @@ fn release_held_now(all: bool) {
                         {
                             // Not waited for: the host keeps the lists
                             // until they are settled.
-                            if behind() && !all {
+                            if behind() && !forcing {
                                 // The line is open while this part is
                                 // prepared and sent: only this thread takes
                                 // from its head (one releaser at a time).
@@ -862,7 +865,7 @@ fn release_held_now(all: bool) {
                                 crate::list::recycle(lists, &order);
                             }
                         }
-                        if all {
+                        if forcing {
                             #[cfg(feature = "diagnostics")]
                             crate::copystat::add(crate::copystat::C::Forced, 1);
                             static ONCE: AtomicBool = AtomicBool::new(false);
@@ -879,7 +882,7 @@ fn release_held_now(all: bool) {
                                 let _ = host.present(&texture, state, frame);
                             }
                         };
-                        if all {
+                        if forcing {
                             show();
                         } else {
                             // The line is open while the frame is shown,
@@ -912,12 +915,15 @@ fn release_held_now(all: bool) {
             }
         }
         if !moved {
-            if joined.is_empty() {
+            if !joined.is_empty() {
+                // Nothing more is free to run behind the parts taken: they go
+                // to the host, and what stood at a wait is looked at again.
+                send_joined(&mut joined);
+            } else if !force || forcing {
                 break;
+            } else {
+                forcing = true;
             }
-            // Nothing more is free to run behind the parts taken: they go
-            // to the host, and what stood at a wait is looked at again.
-            send_joined(&mut joined);
         }
     }
 }
@@ -1096,13 +1102,26 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// `D3D12XBOX_PRESENT_PLANE_PARAMETERS` (72 bytes = 0x48): frame token,
+/// buffer count, resource pointers, optional source/dest rects, color space,
+/// scale filter, extended descs, and MPO blend flags.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
+    _pad0: u32,
     resources: *const This,
+    src_rects: *const [i32; 4],
+    dst_rects: *const [i32; 4],
+    color_space: u32,
+    scale_filter: u32,
+    extended_count: u32,
+    _pad1: u32,
+    extended_descs: *const u8,
+    flags: u32,
+    _pad2: u32,
 }
+const _: () = assert!(size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -1312,13 +1331,9 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         crate::host::settle_for_present();
         release_held_now(false);
         crate::host::settle_for_present();
-    } else if crate::host::late() {
-        // The present is sent ahead too: what waits for a value a flight
-        // will write runs behind that flight, and nothing is settled here.
-        release_held_now(false);
     }
-    // shortcut: what a queue still holds at a present runs now, whatever
-    // its fence: a wait is not kept across frames.
+    // Ready work runs first, including work that can follow an in-flight
+    // memory write. The fallback runs whatever remains held at a present.
     #[cfg(windows)]
     if !sent_behind {
         release_held(forces());
@@ -1372,25 +1387,88 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(windows)]
     if !sent_behind
         && planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let count = (planes as usize).min(crate::host::MAX_PRESENT_PLANES);
+        let mut entries: Vec<(
+            This,
+            &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+            u32,
+            Option<[i32; 4]>,
+            bool,
+        )> = Vec::with_capacity(count);
+        for i in 0..count {
+            // SAFETY: the title passes `planes` `Plane` (72-byte) descriptors.
+            let Some(plane) = (unsafe { plane_parameters.add(i).as_ref() }) else {
+                break;
+            };
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // SAFETY: `plane.resources` holds `plane.count` resource pointers.
+            let resource = unsafe { *plane.resources };
+            let Some(texture) = crate::resource::host_resource(resource) else {
+                continue;
+            };
+            let src_rect = if !plane.src_rects.is_null() {
+                let mut bytes = [0u8; 16];
+                if crate::host::read_into(plane.src_rects.cast::<u8>(), &mut bytes) {
+                    let r = [
+                        i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                        i32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+                        i32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+                        i32::from_ne_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+                    ];
+                    (r[0] >= 0 && r[1] >= 0 && r[2] > r[0] && r[3] > r[1]).then_some(r)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let straight_alpha = (plane.flags & 0x2) != 0;
+            let state_probe = if count == 1 { COPY_SOURCE } else { PIXEL_SHADER_RESOURCE };
+            let state = crate::resource::host_transition(resource, state_probe)
+                .map_or(state_probe, |(_, before)| before);
+            entries.push((resource, texture, state, src_rect, straight_alpha));
+        }
+        if !entries.is_empty() {
+            let shown = if entries.len() == 1
+                && entries[0].3.is_none_or(|r| {
+                    // SAFETY: live host resource.
+                    let d = unsafe { entries[0].1.GetDesc() };
+                    r == [0, 0, d.Width as i32, d.Height as i32]
+                })
+            {
+                host.present(entries[0].1, entries[0].2, frame)
+            } else {
+                let present_planes: Vec<crate::host::PresentPlane<'_>> = entries
+                    .iter()
+                    .map(|&(_, texture, state, src_rect, straight_alpha)| {
+                        crate::host::PresentPlane {
+                            texture,
+                            state,
+                            src_rect,
+                            straight_alpha,
+                        }
+                    })
+                    .collect();
+                host.present_planes(&present_planes, frame)
+            };
+            for &(resource, _, state, _, _) in &entries {
+                crate::resource::host_transition(resource, state);
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, entries[0].0, entries[0].2, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
     }
+    #[cfg(windows)]
+    crate::pipeline::frame_drew(crate::draw::drawn());
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK
@@ -1615,6 +1693,53 @@ mod tests {
             7
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn present_runs_ready_fence_producer_before_blocked_consumer() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut consumer = null;
+        let mut producer = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut consumer), S_OK);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut producer), S_OK);
+        let mut fences = [null; 3];
+        for fence in &mut fences {
+            assert_eq!(
+                crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], fence),
+                S_OK
+            );
+        }
+        let [ready, dependency, sequence] = fences;
+
+        assert_eq!(wait(consumer, dependency, 1), S_OK);
+        assert_eq!(signal(consumer, sequence, 2), S_OK);
+        assert_eq!(wait(producer, ready, 1), S_OK);
+        assert_eq!(signal(producer, sequence, 1), S_OK);
+        assert_eq!(signal(producer, dependency, 1), S_OK);
+        assert_eq!(crate::fence::completed(sequence), 0);
+
+        // A fence signal publishes its value before it wakes waiting queues.
+        // Let a present enter in that interval.
+        crate::fence::set(ready, 1);
+        assert_eq!(present(consumer, 0, null.cast(), null.cast()), S_OK);
+        let last = crate::fence::completed(sequence);
+        for q in [consumer, producer] {
+            assert_eq!(release(q), 0);
+        }
+        for fence in fences {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence),
+                0
+            );
+        }
+        assert_eq!(last, 2, "the consumer must signal after the producer");
     }
 
     /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.

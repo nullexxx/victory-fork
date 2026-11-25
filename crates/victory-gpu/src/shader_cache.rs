@@ -22,6 +22,14 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+fn append_switch(bytes: &mut Vec<u8>, name: &str, value: Option<&std::ffi::OsStr>) {
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.push(b'=');
+    if let Some(value) = value { bytes.extend_from_slice(value.as_encoded_bytes()); }
+    bytes.push(0);
+}
+
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
     match Cache::open(dir) {
@@ -73,6 +81,17 @@ fn build() -> [u8; 32] {
         h.update(exe);
     }
     h.update(&victory_shader::emit::translation_fingerprint());
+    // Flamingo: switches this file reads that change a translation (the
+    // stand-ins, the listed wave forms), with their values; the shader
+    // crate's fingerprint holds only the switches it reads itself.
+    for name in ["VICTORY_AMBIENT_STUB", "VICTORY_SHADOWMASK_STUB", "VICTORY_WAVE_WIDE_ONLY", "VICTORY_FIRSTLANE_OWN_ONLY"] {
+        h.update(name.as_bytes());
+        h.update(b"=");
+        if let Some(value) = std::env::var_os(name) {
+            h.update(value.as_encoded_bytes());
+        }
+        h.update(b"\0");
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -91,14 +110,140 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
+/// A container translated with the forms this file allows it by its hash
+/// (the wave-wide form, the host wave's own first lane: [`WAVE_WIDE`],
+/// [`FIRSTLANE_OWN`]); for runs and the offline warm-up alike, which share
+/// the cache.
+fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
+    let hash = blake3::hash(c).to_hex();
+    victory_shader::emit::with_wave_wide(listed(&WAVE_WIDE, "VICTORY_WAVE_WIDE_ONLY", &WAVE_WIDE_DEFAULT, &hash), || {
+        victory_shader::emit::with_firstlane_own(
+            listed(&FIRSTLANE_OWN, "VICTORY_FIRSTLANE_OWN_ONLY", &FIRSTLANE_OWN_DEFAULT, &hash),
+            || victory_shader::emit::translate(c),
+        )
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// The stand-ins of `victory_shader::emit::stand_in` (from ScarlettPort,
+/// GPL-3.0-or-later), each opt-in:
+/// `VICTORY_AMBIENT_STUB=1` (the diffuse illumination's last pass writes
+/// `VICTORY_AMBIENT_STUB_VALUE`, 0.1 by default) and
+/// `VICTORY_SHADOWMASK_STUB=1` (the ray-traced distant shadows write
+/// `VICTORY_SHADOWMASK_STUB_VALUE`, 1 = lit; each output in its own encoding,
+/// by slot: `VICTORY_AMBIENT_STUB_SLOTS="152=rgb9e5,208=mask,*=f"`), for the containers in
+/// `VICTORY_AMBIENT_STUB_HASHES` / `VICTORY_SHADOWMASK_STUB_HASHES` (the
+/// title's by default). They replace those passes whenever switched on: the
+/// passes translate, but what they read comes from ray tracing, which does
+/// not run on the host yet. Not cached (the cache keys by container).
+fn stand_in(container: &[u8]) -> Option<HostShader> {
+    use victory_shader::emit::stand_in as s;
+    let hash = blake3::hash(container).to_hex()[..16].to_owned();
+    let kinds = [
+        ("VICTORY_AMBIENT_STUB", s::AMBIENT_HASHES, s::AMBIENT_VALUE, s::ambient_slots(&hash)),
+        ("VICTORY_SHADOWMASK_STUB", s::SHADOWMASK_HASHES, s::SHADOWMASK_VALUE, s::SHADOWMASK_SLOTS),
+    ];
+    for (name, hashes, value, defaults) in kinds {
+        if std::env::var(name).ok().as_deref().map(str::trim) != Some("1") {
+            continue;
+        }
+        let listed = match std::env::var(format!("{name}_HASHES")) {
+            Ok(v) => v
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .any(|h| h.eq_ignore_ascii_case(&hash)),
+            Err(_) => hashes.contains(&hash.as_str()),
+        };
+        if !listed {
+            continue;
+        }
+        let value = std::env::var(format!("{name}_VALUE"))
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(value);
+        let slots = std::env::var(format!("{name}_SLOTS")).unwrap_or_default();
+        let plan = s::Plan::new(value)
+            .with_overrides(defaults)
+            .with_overrides(&slots);
+        match s::storing_plan(container, plan) {
+            Ok((shader, plan)) => {
+                tracing::warn!(
+                    %hash,
+                    stand_in = name,
+                    value,
+                    outputs = ?plan.seen,
+                    "pass replaced by a stand-in writing each output in its own encoding"
+                );
+                return Some(shader);
+            }
+            Err(e) => {
+                tracing::warn!(%hash, stand_in = name, error = %e, "stand-in does not translate");
+            }
+        }
+    }
+    None
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    if let Some(shader) = stand_in(container) {
+        return Ok(shader);
+    }
+    let translate = translate_listed;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
+}
+
+/// The containers (by the 16-digit hash the log names shaders with) whose
+/// wave64 compute program may take the wave-wide form on a host of 32-lane
+/// waves (`victory_shader::emit::with_wave_wide`): `VICTORY_WAVE_WIDE_ONLY`,
+/// a list of hashes, or by default the programs of this title that come
+/// out of it with 32-lane waves and otherwise do not run at all on such a
+/// host (the driver refuses their 64-lane form: water transmission
+/// volumetrics, both kinds; particle visibility; the tiling of the
+/// screen-space reflection pass; Flamingo, run 104: the effects heap's
+/// relocations, `CS_DefragHeap_ComputeRelocations`, and the meshlets'
+/// triangle collection, `CS_CollectTriangles_Meshlets`).
+/// `VICTORY_WAVE_WIDE_ONLY=none` allows none.
+static WAVE_WIDE: OnceLock<Vec<String>> = OnceLock::new();
+const WAVE_WIDE_DEFAULT: [&str; 6] = [
+    "5dc3b25986622949",
+    "6f225b641c5b0708",
+    "369cbe906ea72764",
+    "2cc4c197ee29e291",
+    "02384a60fda6f2d0",
+    "6b82bc7d22016cb5",
+];
+
+/// The containers whose first-lane reads where not every lane runs take the
+/// host wave's own first lane (`victory_shader::emit::with_firstlane_own`):
+/// `VICTORY_FIRSTLANE_OWN_ONLY`, or by default the three programs of the
+/// ray-tracing structure builder (`XboxBvhBuilder.dll`) that need it to
+/// translate for 32-lane waves. Their scans read a sum of scalars, the same
+/// in every lane of the console wave, which is where the host wave's own
+/// first lane is exact; without them the builder's other 49 programs cannot
+/// run either (its stages run all or none, `crate::pipeline`).
+static FIRSTLANE_OWN: OnceLock<Vec<String>> = OnceLock::new();
+// (As the title passes them, then as `victory translate` finds them in the DLL.)
+const FIRSTLANE_OWN_DEFAULT: [&str; 6] = [
+    "39321a95223001ed",
+    "77360df21e12ea43",
+    "9fc111d3be79364f",
+    "dc78c5de69c7c155",
+    "322ed4ad832bdea6",
+    "d441b097704ab616",
+];
+
+/// Whether `hash` (a container's, in hex) is on the list `env` names (hashes
+/// separated by commas, `none` for none), or on `default` without it.
+fn listed(list: &OnceLock<Vec<String>>, env: &str, default: &[&str], hash: &str) -> bool {
+    let list = list.get_or_init(|| match std::env::var(env) {
+        Ok(v) => v.split(',').map(|h| h.trim().to_lowercase()).filter(|h| !h.is_empty() && h != "none").collect(),
+        Err(_) => default.iter().map(|h| h.to_string()).collect(),
+    });
+    list.iter().any(|h| hash.starts_with(h.as_str()))
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -155,7 +300,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -197,6 +342,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
+    word(&mut out, u32::from(s.dispatch_x_one));
     word(&mut out, s.dxil.len() as u32);
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
@@ -249,7 +395,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     out
 }
 
-fn decode(bytes: &[u8]) -> Option<HostShader> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<HostShader> {
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
         fn take(&mut self, n: usize) -> Option<&'a [u8]> {
@@ -270,6 +416,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         return None;
     }
     let stage = *STAGES.get(r.word()? as usize)?;
+    let dispatch_x_one = match r.word()? {
+        0 => false,
+        1 if stage == HwStage::Cs => true,
+        _ => return None,
+    };
     let dxil = r.list()?;
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
@@ -316,6 +467,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     r.0.is_empty().then_some(HostShader {
         stage,
+        dispatch_x_one,
         dxil,
         user_data,
         samplers,
@@ -331,9 +483,33 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cached_shader_preserves_dispatch_contract() {
+        let mut compute = shader();
+        compute.stage = HwStage::Cs;
+        compute.dispatch_x_one = true;
+        assert!(decode(&encode(&compute)).unwrap().dispatch_x_one);
+        compute.dispatch_x_one = false;
+        assert!(!decode(&encode(&compute)).unwrap().dispatch_x_one);
+        compute.stage = HwStage::Ps;
+        compute.dispatch_x_one = true;
+        assert!(decode(&encode(&compute)).is_none());
+    }
+
+    #[test]
+    fn split_lds_setting_changes_cache_key_material() {
+        let mut off = Vec::new();
+        let mut on = Vec::new();
+        append_switch(&mut off, "VICTORY_SPLIT_LDS", None);
+        append_switch(&mut on, "VICTORY_SPLIT_LDS", Some(std::ffi::OsStr::new("1")));
+        assert_ne!(blake3::hash(&off), blake3::hash(&on));
+    }
+
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
+            dispatch_x_one: false,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,

@@ -47,16 +47,19 @@ fn main() {
         fnv(&mut state, &(text.len() as u64).to_le_bytes());
         fnv(&mut state, &text);
         let s = String::from_utf8_lossy(&text);
-        let mut rest = &s[..];
-        while let Some(at) = rest.find("\"VICTORY_") {
-            let tail = &rest[at + 1..];
-            let end = tail
-                .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
-                .unwrap_or(tail.len());
-            if tail[end..].starts_with('"') {
-                switches.insert(tail[..end].to_string());
+        // Flamingo's own switches (`FLAMINGO_*`) change translations too.
+        for prefix in ["\"VICTORY_", "\"FLAMINGO_"] {
+            let mut rest = &s[..];
+            while let Some(at) = rest.find(prefix) {
+                let tail = &rest[at + 1..];
+                let end = tail
+                    .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                    .unwrap_or(tail.len());
+                if tail[end..].starts_with('"') {
+                    switches.insert(tail[..end].to_string());
+                }
+                rest = &tail[end..];
             }
-            rest = &tail[end..];
         }
     }
     println!("cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={:016x}{:016x}", state[0], state[1]);

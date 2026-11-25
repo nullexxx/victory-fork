@@ -13,7 +13,7 @@
 //! parameters, by data flow: copies, phis that agree, and additions.
 
 use crate::ShaderError;
-use crate::gfx10::{Fields, NULL, Operand};
+use crate::gfx10::{Fields, NULL, Operand, lane_selector_mask};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Meets, Structured};
@@ -45,6 +45,13 @@ pub const CODE: usize = usize::MAX;
 /// structures). Offset and computed term are not used: lowering takes the
 /// 64-bit address from the instruction's operands.
 pub const MEMORY: usize = usize::MAX - 1;
+
+/// [`Address::param`] of the console runtime's own table, which the merged
+/// geometry stage ([`crate::merged`]) gets as a 64-bit pointer in user data
+/// 0 and 1 when the root layout puts no parameter there. It is not a title
+/// resource: the host has nothing to bind for it, and a scalar load from it
+/// (the offset is the load's) is for emission to model.
+pub const RUNTIME_TABLE: usize = usize::MAX - 2;
 
 /// The reasons an address traces to no root parameter for which the
 /// address is then taken as it stands ([`MEMORY`]).
@@ -204,7 +211,33 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage, lanes)?;
+    track_with(p, layout, stage, lanes, false)
+}
+
+/// [`track`] for a half of a merged ES+GS stage whose `layout` lists the
+/// root parameters of both halves ([`crate::merged::MergedGs::program`]), or
+/// is taken to (a geometry program on its own, with the ES half unknown):
+/// then the first two user-data dwords that no parameter holds are the
+/// console runtime's table pointer ([`RUNTIME_TABLE`]). Without the other
+/// half's parameters that is a guess: the ES half may own those dwords.
+pub fn track_merged(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    lanes: Option<&Structured>,
+) -> Result<Resources, ShaderError> {
+    track_with(p, layout, stage, lanes, true)
+}
+
+fn track_with(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    lanes: Option<&Structured>,
+    merged: bool,
+) -> Result<Resources, ShaderError> {
+    let mut t = Tracer::new(p, layout, stage, lanes)?;
+    t.merged = merged;
     let mut out = Resources {
         params: p
             .inputs
@@ -413,6 +446,9 @@ struct Tracer<'a> {
     rpo: Vec<usize>,
     /// The block of the access being traced ([`Self::live`]).
     at: std::cell::Cell<Option<usize>>,
+    /// The layout is the merged stage's ([`track_merged`]): the runtime
+    /// table is looked for in it.
+    merged: bool,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -480,6 +516,7 @@ impl<'a> Tracer<'a> {
             meets: Default::default(),
             rpo,
             at: Default::default(),
+            merged: false,
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -582,6 +619,18 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// Whether `reg` is the low half of the console runtime's table pointer
+    /// ([`RUNTIME_TABLE`]): the first two user-data dwords of a geometry
+    /// program, when the root layout puts no parameter on either.
+    fn runtime_table(&self, reg: Reg) -> bool {
+        let first = self.stage.user_sgpr(crate::merged::RUNTIME_TABLE);
+        self.merged
+            && matches!(self.stage, HwStage::Gs | HwStage::Es)
+            && reg == Reg::S(first)
+            && self.param_of(reg).is_none()
+            && self.param_of(Reg::S(first + 1)).is_none()
+    }
+
     /// The SOP2 operands of `v` if an instruction with one of `names` wrote it.
     fn sop2(&self, v: Value, names: &[&str]) -> Option<(&'a Inst, [Term; 2])> {
         let inst = self.def(v)?;
@@ -655,6 +704,11 @@ impl<'a> Tracer<'a> {
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
                 Some((_, 0)) => Sum {
+                    base: Some(v),
+                    offset: 0,
+                    dynamic: None,
+                },
+                None if self.runtime_table(reg) => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -966,6 +1020,27 @@ impl<'a> Tracer<'a> {
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
+        if self.runtime_table(reg) {
+            // A 64-bit pointer: its high half is the next user-data dword,
+            // as a root descriptor's is.
+            let high = self
+                .p
+                .inputs
+                .iter()
+                .find(|i| i.0 == Reg::S(self.stage.user_sgpr(crate::merged::RUNTIME_TABLE) + 1))
+                .ok_or("the runtime table without its high half")?
+                .1;
+            if !self.high_half(hi, Some(high))
+                && !(s.dynamic.or(extra.dynamic).is_some() && self.carried(hi, high))
+            {
+                return Err("an address with an untracked high half");
+            }
+            return Ok(Address {
+                param: RUNTIME_TABLE,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic: s.dynamic.or(extra.dynamic),
+            });
+        }
         let (param, _) = self
             .param_of(reg)
             .ok_or("an address not from a root parameter")?;
@@ -1192,6 +1267,9 @@ impl<'a> Tracer<'a> {
                 bits,
                 words: [w2, w3],
             });
+        }
+        if let Some(source) = self.raw_view(words) {
+            return Ok(source);
         }
         let loaded = |w: &Term| {
             matches!(*w, Term::Value(v)
@@ -2066,6 +2144,48 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
+    /// A loaded buffer descriptor the code views as a raw buffer, as the
+    /// FidelityFX upscaler's programs do before byte-addressed access: the
+    /// stride cleared (dword 1 bits 16-29), the record count multiplied (by
+    /// the stride, into bytes), the out-of-bounds mode set (dword 3 bits
+    /// 28-29). The base address and everything else stay as loaded, so it
+    /// is the loaded descriptor; the host reads it raw through its view.
+    fn raw_view(&self, words: &[Term]) -> Option<Source> {
+        const STRIDE: u32 = 0x3FFF_0000;
+        const OOB: u32 = 0x3000_0000;
+        let [w0, w1, w2, w3] = *words else {
+            return None;
+        };
+        let value = |t: Term| match t {
+            Term::Value(v) => Some(v),
+            Term::Const(_) => None,
+        };
+        let w1 = match self.sop2(value(w1)?, &["s_and_b32"]) {
+            Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) if m | STRIDE == !0 => x,
+            _ => w1,
+        };
+        let w2 = match self.sop2(value(w2)?, &["s_mul_i32"]) {
+            Some((_, [x, _])) if self.loaded(&[w0, w1, x]).is_some() => x,
+            Some((_, [_, y])) => y,
+            None => w2,
+        };
+        let mut w3 = w3;
+        if let Some((_, [x, Term::Const(o)] | [Term::Const(o), x])) =
+            self.sop2(value(w3)?, &["s_or_b32"])
+            && o & !OOB == 0
+        {
+            w3 = x;
+        }
+        if let Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) =
+            self.sop2(value(w3)?, &["s_and_b32"])
+            && m | OOB == !0
+        {
+            w3 = x;
+        }
+        let source = self.loaded(&[w0, w1, w2, w3])?;
+        (words != [w0, w1, w2, w3]).then_some(source)
+    }
+
     /// Consecutive dwords of one scalar load.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
@@ -2264,7 +2384,8 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane, self.p.wave64)?;
+        self.spilled(inst.read(Reg::V(reg))?, lane, &mut Vec::new())
             .ok()
             .flatten()
     }
@@ -2298,7 +2419,7 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
+        if lane_of(*at, self.p.wave64).ok_or(())? != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
@@ -2314,13 +2435,14 @@ impl Tracer<'_> {
     }
 }
 
-/// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
+/// A constant lane selector normalized to the guest wave width.
+fn lane_of(op: Operand, wave64: bool) -> Option<u32> {
     match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
         _ => None,
     }
+    .map(|lane| lane & lane_selector_mask(wave64))
 }
 
 /// What dword `k` of a move's result copies.
@@ -2331,8 +2453,17 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    if inst.name() == "s_bfm_b32" && k == 0 {
+        // A bit field of constant width and offset (a sampler word, say).
+        // (a width and an offset, not lane selectors: `& 31` below; 6 bits kept)
+        let (width, at) = (lane_of(*src.first()?, true)?, lane_of(*src.get(1)?, true)?);
+        let ones = (1u32 << (width & 31)).wrapping_sub(1);
+        return Some(Moved::Const(ones << (at & 31)));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
+        // A 32-bit literal of a 64-bit integer move is zero-extended.
+        ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
             inst.read(Reg::S(code + k as u8)).map(Moved::Value)
         }
@@ -2385,6 +2516,8 @@ pub(crate) mod tests {
     fn track_words(words: &[u32], layout: &[RootParam], stage: HwStage) -> Resources {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
+        // (a geometry program is the merged stage's, with the layout of both halves)
+        let track = if matches!(stage, HwStage::Gs | HwStage::Es) { track_merged } else { track };
         track(&p, layout, stage, lanes(&p).as_ref()).unwrap()
     }
 
@@ -2451,6 +2584,45 @@ pub(crate) mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_loaded_buffer_descriptor_viewed_raw_is_the_loaded_one() {
+        // As the FidelityFX upscaler's programs do (FSPX).
+        let mut words = vec![
+            0xBE8A_0304, // s_mov_b32 s10, s4
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF408_0305,
+            0xFA00_0160, // s_load_dwordx4 s[12:15], s[10:11], 0x160
+            0x938A_FF0D,
+            0x000E_0010, // s_bfe_u32 s10, s13, 0x000e0010 (the stride)
+            0x848A_810A, // s_max_u32 s10, s10, 1
+            0x870F_FF0F,
+            0xCFFF_FFFF, // s_and_b32 s15, s15, 0xcfffffff
+            0x930E_0A0E, // s_mul_i32 s14, s14, s10
+            0x880F_FF0F,
+            0x3000_0000, // s_or_b32 s15, s15, 0x30000000
+            0x870D_FF0D,
+            0xC000_FFFF, // s_and_b32 s13, s13, 0xc000ffff
+            0xE038_1000,
+            0x8003_0802, // buffer_load_dwordx4 v[8:11], v2, s[12:15], 0 offen
+            S_ENDPGM,
+        ];
+        let layout = [param(Table, 4, 1)];
+        let r = track_words(&words, &layout, HwStage::Cs);
+        assert_eq!(r.scalar, [((0, 2), at(0, 0x160))]);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 2),
+                first: 0
+            }
+        );
+        // A moved base address is another buffer.
+        words.insert(14, 0x800C_900C); // s_add_u32 s12, s12, 16
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        assert!(track(&p, &layout, HwStage::Cs, None).is_err());
     }
 
     #[test]
@@ -2551,6 +2723,40 @@ pub(crate) mod tests {
             HwStage::Ps,
         );
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+    }
+
+    #[test]
+    fn wrapped_lane_selectors_trace_the_last_descriptor_write() {
+        for (write, read) in [(35u32, 3u32), (3, 35)] {
+            let words = [
+                0x7E00_0287u32, // v_mov_b32 v0, 7 (ordinary vector use prevents unspill)
+                0xD761_0000,
+                0x0001_0609, // v_writelane_b32 v0, s9, 3
+                0xD761_0000,
+                (128 + write) << 9 | 10, // v_writelane_b32 v0, s10, write
+                0xD760_0002,
+                (128 + read) << 9 | 0x100, // v_readlane_b32 s2, v0, read
+                0xBE83_0380,               // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ];
+            let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 8).unwrap();
+            assert_eq!(p.blocks[0].insts[3].name(), "v_readlane_b32");
+            let r = track(
+                &p,
+                &[param(Table, 9, 1), param(Table, 10, 1)],
+                HwStage::Cs,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                r.scalar,
+                [((0, 5), at(1, 0x20))],
+                "write {write}, read {read}"
+            );
+        }
     }
 
     #[test]
@@ -3845,4 +4051,96 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
     }
+
+    /// `s_load_dword s0, s[<base>:<base + 1>], 0xb8`.
+    fn load_b8(base: u32) -> [u32; 3] {
+        [0xF400_0000 | base >> 1, 0xFA00_00B8, S_ENDPGM]
+    }
+
+    fn track_error(words: &[u32], layout: &[RootParam], stage: HwStage) -> ShaderError {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let track = if matches!(stage, HwStage::Gs | HwStage::Es) { track_merged } else { track };
+        track(&p, layout, stage, lanes(&p).as_ref()).unwrap_err()
+    }
+
+    /// The merged geometry stage's first two user-data dwords (s8, s9) are
+    /// the console runtime's table pointer, which no root parameter is. A
+    /// load through it is traced to [`RUNTIME_TABLE`] with the load's
+    /// offset, where it used to fail with "an address in an SGPR that is no
+    /// root parameter" (the 195 geometry programs of the title, one shader).
+    #[test]
+    fn a_geometry_program_loads_from_the_runtime_table() {
+        let r = track_words(&load_b8(8), &[], HwStage::Gs);
+        assert_eq!(r.scalar, [((0, 0), at(RUNTIME_TABLE, 0xB8))]);
+        // The root parameters of the title sit after it, in the same stage.
+        let r = track_words(&load_b8(8), &[param(Table, 2, 1)], HwStage::Gs);
+        assert_eq!(r.scalar, [((0, 0), at(RUNTIME_TABLE, 0xB8))]);
+    }
+
+    /// Only a layout that holds both halves' parameters can say the first two
+    /// user-data dwords are no one's: a geometry program tracked as it is, with
+    /// the ES half unknown, still fails on a load through them.
+    #[test]
+    fn the_runtime_table_needs_the_merged_layout() {
+        let code: Vec<u8> = load_b8(8).iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Gs, lanes(&p).as_ref()).unwrap_err();
+        assert!(matches!(err, ShaderError::Unsupported { what, .. } if what == NO_ROOT_WHAT), "{err:?}");
+    }
+
+    #[test]
+    fn the_runtime_table_is_for_the_merged_stage_and_gives_way_to_the_layout() {
+        // The same load in any other stage still fails: s8 is no parameter.
+        for stage in [HwStage::Vs, HwStage::Ps, HwStage::Ms] {
+            let err = track_error(&load_b8(8), &[], stage);
+            assert!(
+                matches!(err, ShaderError::Unsupported { what, .. } if what == NO_ROOT_WHAT),
+                "{stage:?}: {err:?}"
+            );
+        }
+        // A root descriptor in user data 0 and 1 is the title's, not the table.
+        let r = track_words(&load_b8(8), &[param(Descriptor, 0, 2)], HwStage::Gs);
+        assert_eq!(r.scalar, [((0, 0), at(0, 0xB8))]);
+        // A parameter on either dword takes the pair away.
+        let err = track_error(&load_b8(8), &[param(Constants, 1, 1)], HwStage::Gs);
+        assert!(matches!(err, ShaderError::Unsupported { .. }), "{err:?}");
+    }
+
+    /// The ES and GS halves run on one wave and share its SGPRs, so the
+    /// pointer is in the same two registers when the ES half loads from it.
+    /// Whether the title's ES programs do is not known: this only keeps one
+    /// from failing on it where the GS half does not.
+    #[test]
+    fn the_es_half_sees_the_same_runtime_table() {
+        let r = track_words(&load_b8(8), &[], HwStage::Es);
+        assert_eq!(r.scalar, [((0, 0), at(RUNTIME_TABLE, 0xB8))]);
+        let err = track_error(&load_b8(8), &[param(Constants, 1, 1)], HwStage::Es);
+        assert!(matches!(err, ShaderError::Unsupported { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn only_the_first_user_data_pair_is_the_runtime_table() {
+        // s[20:21] is user data 12 and 13: still no root parameter.
+        let err = track_error(&load_b8(20), &[], HwStage::Gs);
+        assert!(matches!(err, ShaderError::Unsupported { what, .. } if what == NO_ROOT_WHAT));
+        // The high half of the pointer must be the register as it arrived (a
+        // program that sets it first never reads it as an input).
+        let err = track_error(
+            &[
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF400_0004,
+                0xFA00_00B8, // s_load_dword s0, s[8:9], 0xb8
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Gs,
+        );
+        assert!(
+            matches!(err, ShaderError::Unsupported { what, .. } if what == "the runtime table without its high half"),
+            "{err:?}"
+        );
+    }
+
+    const NO_ROOT_WHAT: &str = "an address in an SGPR that is no root parameter";
 }

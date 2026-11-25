@@ -168,10 +168,12 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        gs: None,
     })
     .expect("lower");
 
     let shader = HostShader {
+        dispatch_x_one: false,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -217,15 +219,24 @@ fn run_cases_on(
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = 0;
+    let (mut ran, mut no_32_lanes) = (0, 0);
     for &(label, warp) in devices {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(made) => made,
+            // A program that declares `WaveSize(32)` (one thread with LDS, say) on a device
+            // without 32-lane waves (#356: 16 at most): refused, as it should be; not run.
+            Err(e) if !host.runs_waves_of(32) => {
+                let (min, max) = host.wave_lanes().unwrap_or_default();
+                eprintln!("{label}: waves of {min} to {max} lanes, not 32; skipped ({e})");
+                no_32_lanes += 1;
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
         for (i, &inputs) in cases.iter().enumerate() {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -256,7 +267,25 @@ fn run_cases_on(
         eprintln!("no SM 6.6 hardware device; a hardware-only case not run");
         return;
     }
-    assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
+    assert!(ran + no_32_lanes > 0, "no SM 6.6 device available ({devices:?})");
+}
+
+/// Each device says which wave sizes it runs (what the skip above goes by): a power-of-two
+/// range, which its own ends are in.
+#[test]
+fn devices_report_their_wave_sizes() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (min, max) = host.wave_lanes().expect("OPTIONS1");
+        eprintln!("{label}: waves of {min} to {max} lanes");
+        assert!(min.is_power_of_two() && max.is_power_of_two() && min <= max, "{min}..{max}");
+        assert!(host.runs_waves_of(min) && host.runs_waves_of(max));
+        assert!(!host.runs_waves_of(max * 2) && !host.runs_waves_of(min / 2));
+    }
 }
 
 fn is_f16_nan(bits: u16) -> bool {
@@ -1546,6 +1575,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
+        gs: None,
         native: &native,
         p: &p,
         st: &st,
@@ -1559,6 +1589,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
     .expect("lower");
 
     let shader = HostShader {
+        dispatch_x_one: false,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

@@ -26,6 +26,16 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Where the [`SLOT_STRIDES`] buffer goes on, in dwords: two per heap slot,
+/// the low and then the high dword of the title address of the buffer view
+/// at that slot (0: none). For a program that takes a buffer view out of the
+/// heap at an index it computes and reads the address out of the descriptor
+/// to walk the memory behind it (the shadow-ray trace programs take their
+/// ray-tracing structure this way).
+pub const SLOT_ADDRESSES: u32 = SLOT_STRIDES_COUNT;
+/// Dwords of the whole [`SLOT_STRIDES`] buffer: the strides, then the
+/// addresses ([`SLOT_ADDRESSES`]).
+pub const SLOT_STRIDES_DWORDS: u32 = 3 * SLOT_STRIDES_COUNT;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -119,6 +129,19 @@ pub(crate) struct Geometry {
 /// larger) hung its GPU (GPU-based validation: "descriptor heap index out of bounds"), and AMD
 /// RDNA3 took a page fault and removed the device.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_VIEW_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+fn view_limit() -> u32 {
+    #[cfg(test)]
+    if let Some(limit) = TEST_VIEW_LIMIT.get() {
+        return limit;
+    }
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
@@ -229,7 +252,13 @@ impl Shader {
             return g;
         }
         let arr = self.m.array(self.lds_dwords, self.t.i32);
-        let g = self.m.global("lds", arr, 3);
+        // A geometry shader has no group: its "LDS" is the thread's own array
+        // (the records it writes before it emits them).
+        let g = if self.geometry.is_some() {
+            self.m.private_global("gsout", arr)
+        } else {
+            self.m.global("lds", arr, 3)
+        };
         self.lds = Some(g);
         g
     }
@@ -403,7 +432,7 @@ impl Shader {
         props: (u32, u32),
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let limit = view_limit();
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
@@ -444,7 +473,12 @@ impl Shader {
     }
 
     /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
+        self.finish_checked(None)
+            .expect("ordinary shader serialization")
+    }
+
+    pub(super) fn finish_checked(mut self, snapshot_slot: Option<u32>) -> Option<Vec<u8>> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -466,6 +500,9 @@ impl Shader {
                     self.flags &= !flag;
                 }
             }
+        }
+        if snapshot_slot.is_some() && !self.m.certifies_split_lds(snapshot_slot) {
+            return None;
         }
         let mut resources = None;
         let mut bindings = Vec::new();
@@ -836,7 +873,7 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        Some(container::build(&parts))
     }
 
     /// The user-data buffer's annotation carries its size, known only now.

@@ -18,6 +18,7 @@ victory-shader.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+victory-shader = { workspace = true, features = ["synthetic"] }
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
@@ -38,5 +39,6 @@ windows = { workspace = true, features = [
     "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

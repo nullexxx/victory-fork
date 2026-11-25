@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 pub mod census;
+mod group_sync;
 pub mod opt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -55,8 +56,11 @@ struct Global {
     /// Its pointer type.
     ptr: Ty,
     space: u32,
-    /// An internal constant with this initialiser (a constant table).
+    /// An internal global with this initialiser (a constant table, or the
+    /// undefined start of a private array).
     init: Option<u32>,
+    /// Read-only: the initialiser is a constant table.
+    constant: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -359,6 +363,7 @@ impl Module {
             ptr,
             space,
             init: None,
+            constant: false,
         });
         V::Global(self.globals.len() as u32 - 1)
     }
@@ -369,6 +374,20 @@ impl Module {
             panic!("a global initialised with a non-constant")
         };
         let ty = self.consts[i as usize].0;
+        let g = self.global(name, ty, 0);
+        if let V::Global(n) = g {
+            self.globals[n as usize].init = Some(i);
+            self.globals[n as usize].constant = true;
+        }
+        g
+    }
+
+    /// An internal global of `ty` in the default address space that the
+    /// shader writes and reads back: private to each thread, undefined at
+    /// the start.
+    pub fn private_global(&mut self, name: &str, ty: Ty) -> V {
+        let init = self.undef(ty);
+        let V::Const(i) = init else { unreachable!() };
         let g = self.global(name, ty, 0);
         if let V::Global(n) = g {
             self.globals[n as usize].init = Some(i);
@@ -619,7 +638,7 @@ impl Module {
             // + 1, linkage (external 0, internal 3), log2 alignment + 1,
             // section]
             let (constant, init, linkage) = match g.init {
-                Some(i) => (1, first_const + u64::from(i) + 1, 3),
+                Some(i) => (u64::from(g.constant), first_const + u64::from(i) + 1, 3),
                 None => (0, 0, 0),
             };
             w.record(

@@ -4,6 +4,8 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+#[cfg(windows)]
+mod discord;
 mod inspect;
 mod run;
 mod shader;

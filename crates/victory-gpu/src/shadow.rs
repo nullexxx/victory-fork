@@ -77,6 +77,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Flamingo: the frame (plus one) whose lists last declared shader
+    /// writes here ([`Shadow::gpu_wrote_lately`]); 0 if none ever did.
+    gpu_wrote: AtomicU64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -686,38 +689,45 @@ pub(crate) fn relay_fetched(number: u64) {
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
 #[derive(Default)]
-struct Flights(Vec<((usize, usize), u32, u64)>);
+struct Flights(BTreeMap<(usize, usize), (u32, u64)>);
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
-    /// often it declares it.
+    /// often it declares it. Index exact ranges; overlapping ranges remain
+    /// independent, as before.
     fn declare(&mut self, range: (usize, usize), number: u64) {
-        match self.0.iter_mut().find(|f| f.0 == range) {
-            Some(f) => {
-                if f.2 != number {
-                    f.1 += 1;
-                    f.2 = number;
+        use std::collections::btree_map::Entry;
+        match self.0.entry(range) {
+            Entry::Occupied(mut entry) => {
+                let (count, last) = entry.get_mut();
+                if *last != number {
+                    *count += 1;
+                    *last = number;
                 }
             }
-            None => self.0.push((range, 1, number)),
+            Entry::Vacant(entry) => {
+                entry.insert((1, number));
+            }
         }
     }
 
     /// One submission that declared `ranges` (each once) is copied back:
-    /// the ranges no other submission still holds.
+    /// the ranges no other submission still holds, in input order.
     fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        use std::collections::btree_map::Entry;
         let mut free = Vec::new();
         for range in ranges {
-            match self.0.iter().position(|f| f.0 == *range) {
-                Some(at) => {
-                    self.0[at].1 = self.0[at].1.saturating_sub(1);
-                    if self.0[at].1 == 0 {
-                        self.0.swap_remove(at);
+            match self.0.entry(*range) {
+                Entry::Occupied(mut entry) => {
+                    let count = &mut entry.get_mut().0;
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        entry.remove();
                         free.push(*range);
                     }
                 }
                 // Not counted (declared before anything counted): free.
-                None => free.push(*range),
+                Entry::Vacant(_) => free.push(*range),
             }
         }
         free
@@ -738,16 +748,10 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
-    }
-    differs != 0
+    relay_merge_simd::merge(now, held, title)
 }
+
+mod relay_merge_simd;
 
 /// `[from, to)` without the ranges of `skip`, in order.
 pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
@@ -950,6 +954,60 @@ mod relay_tests {
         assert_eq!(flights.done(&[a]), vec![a]);
         // A range never counted is free at once.
         assert_eq!(flights.done(&[b]), vec![b]);
+    }
+
+    /// Compare indexed bookkeeping with the previous vector algorithm,
+    /// including duplicate declarations, overlapping and unknown ranges,
+    /// and completions that arrive in a different order.
+    #[test]
+    fn indexed_flights_match_vector_reference() {
+        let mut seed = 0x6a09_e667u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for _ in 0..32 {
+            let mut indexed = Flights::default();
+            let mut reference: Vec<((usize, usize), u32, u64)> = Vec::new();
+            for _ in 0..2048 {
+                let start = (next() % 128) as usize * 64;
+                let range = (start, start + (next() % 8 + 1) as usize * 64);
+                let number = u64::from(next() % 16);
+                if next() >> 31 == 0 {
+                    indexed.declare(range, number);
+                    match reference.iter_mut().find(|f| f.0 == range) {
+                        Some(f) if f.2 != number => {
+                            f.1 += 1;
+                            f.2 = number;
+                        }
+                        Some(_) => {}
+                        None => reference.push((range, 1, number)),
+                    }
+                } else {
+                    let ranges = [range, (start + 32, range.1 + 32)];
+                    let mut free = Vec::new();
+                    for r in ranges {
+                        match reference.iter().position(|f| f.0 == r) {
+                            Some(at) => {
+                                reference[at].1 = reference[at].1.saturating_sub(1);
+                                if reference[at].1 == 0 {
+                                    reference.swap_remove(at);
+                                    free.push(r);
+                                }
+                            }
+                            None => free.push(r),
+                        }
+                    }
+                    assert_eq!(indexed.done(&ranges), free);
+                }
+                assert_eq!(indexed.0.len(), reference.len());
+                for &(r, count, last) in &reference {
+                    assert_eq!(indexed.0.get(&r), Some(&(count, last)));
+                }
+            }
+        }
     }
 
     /// The merge moves exactly the bytes the card changed, into title
@@ -1935,6 +1993,48 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Flamingo (`FLAMINGO_CARD_FILLS=1`): reads of title memory that shaders
+/// wrote lately, made on the card in the list's order instead of on the
+/// CPU at submission. A read at submission has to wait for every flight
+/// that may write the memory to land: a 20 KiB title buffer copy out of the
+/// 174 MB buffer the shaders write held the submitting thread 23-34 ms a
+/// frame (run 67), and the misaligned constant buffers in that buffer read
+/// for draws did the same once the copy no longer did (run 45).
+pub(crate) fn card_fills() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLAMINGO_CARD_FILLS").is_some_and(|v| v == "1"))
+}
+
+/// A title buffer copy (`dst`, `src` title addresses, `len` bytes) made on
+/// the card when shaders wrote its source lately ([`card_fills`]): true if
+/// it was recorded so. What it writes goes back to title memory as shader
+/// writes do.
+pub(crate) fn copy_on_card(list: &HostList, dst: u64, src: u64, len: u64) -> bool {
+    if len == 0 || !card_fills() {
+        return false;
+    }
+    let Some(from) = find(src, len) else { return false };
+    if !from.gpu_wrote_lately() {
+        return false;
+    }
+    let Some(to) = find(dst, len) else { return false };
+    if Arc::ptr_eq(&from, &to) || from.left(src) < len || to.left(dst) < len {
+        return false;
+    }
+    // SAFETY: plain queries of live buffers.
+    let (from_base, to_base) = unsafe { (from.buffer.GetGPUVirtualAddress(), to.buffer.GetGPUVirtualAddress()) };
+    let (Some(from_at), Some(to_at)) = (from.gpu(src).checked_sub(from_base), to.gpu(dst).checked_sub(to_base)) else {
+        return false;
+    };
+    from.refresh(list, src, len);
+    to.refresh(list, dst, len);
+    to.gpu_writes(list, dst, len);
+    // SAFETY: an open list and live buffers; the ranges lie in them. The
+    // title's own barriers order it against the shaders around it.
+    unsafe { list.list.CopyBufferRegion(&to.buffer, to_at, &from.buffer, from_at, len) };
+    true
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
@@ -2317,7 +2417,15 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            gpu_wrote: AtomicU64::new(0),
         }
+    }
+
+    /// Flamingo: whether lists of this frame or the last declared shader
+    /// writes here: what title memory holds here may be behind the card's.
+    pub(crate) fn gpu_wrote_lately(&self) -> bool {
+        let wrote = self.gpu_wrote.load(Ordering::Relaxed);
+        wrote != 0 && wrote + 1 >= crate::frame::current()
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2337,6 +2445,7 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.gpu_wrote.store(crate::frame::current() + 1, Ordering::Relaxed);
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer

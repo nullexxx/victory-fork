@@ -16,6 +16,8 @@ zlib-rs.workspace = true
 host = ["dep:windows"]
 # Debugging switches (emitted-module dumps and the like).
 diagnostics = []
+# Synthetic shader containers (`synthetic`), for the tests of crates that use this one.
+synthetic = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }

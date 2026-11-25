@@ -119,10 +119,12 @@ fn lowered_on(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        gs: None,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
     Ok(HostShader {
+        dispatch_x_one: false,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -449,24 +451,100 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     Some(out[0][0])
 }
 
+#[test]
+fn local_waves_select_their_console_bits_from_a_constant_mask() {
+    let words = [
+        0xD760_000E,
+        0x0001_0100, // v_readlane_b32 s14, v0, 0: require console lane numbering
+        0xBE8C_0380, // s_mov_b32 s12, 0
+        0xBE8D_03C1, // s_mov_b32 s13, -1
+        0xD501_0001,
+        0x0031_0280, // v_cndmask_b32 v1, 0, 1, s[12:13]
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xE070_1000,
+        0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lower::with_local_waves_any(|| lowered(&native, &p, &HashSet::new()))
+        .expect("lower a constant mask on two host waves");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch the constant mask");
+    assert_eq!(&out[0][..32], &[0; 32]);
+    assert_eq!(&out[0][32..], &[1; 32]);
+    eprintln!("ran on the hardware device: each half selected its own mask bits");
+}
+
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
 /// and a number on the other, and is read as a number after the join, as the trace programs
 /// keep their lanes' masks and their node numbers on one stack
 /// (`deferred_tiled:CS_LaserLightShadowRaytracing`, s46 at 0x104, 0x75c and 0x188). The
 /// mask arrives as the ballot of its lanes.
+const MASK_OR_NUMBER: [u32; 8] = [
+    0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+    0xBE94_036A, // s_mov_b32 s20, vcc_lo
+    0xBF06_8001, // s_cmp_eq_u32 s1, 0
+    0xBF85_0001, // s_cbranch_scc1 over the next
+    0xBE94_0385, // s_mov_b32 s20, 5
+    0x7E00_0214, // v_mov_b32 v0, s20
+    0x38 << 26 | 0x1C << 18,
+    0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+];
+
+/// The program above reads a lane mask as a number (on the path that kept it), so it needs
+/// the console's 32 lanes in a host wave: it declares `WaveSize(32)`. Without it, a host of
+/// 16-lane waves gave only 16 of the mask's bits (#356).
+#[test]
+fn a_lane_mask_joined_with_a_number_needs_the_consoles_wave_size() {
+    let native = native_of(&MASK_OR_NUMBER, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let lowered = lower::lower(&lower::Parts {
+        gs: None,
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    assert_eq!(lowered.expect("lower").wave_size, Some(32));
+}
+
 #[test]
 fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
-    let words = [
-        0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
-        0xBE94_036A, // s_mov_b32 s20, vcc_lo
-        0xBF06_8001, // s_cmp_eq_u32 s1, 0
-        0xBF85_0001, // s_cbranch_scc1 over the next
-        0xBE94_0385, // s_mov_b32 s20, 5
-        0x7E00_0214, // v_mov_b32 v0, s20
-        0x38 << 26 | 0x1C << 18,
-        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
-    ];
-    let native = native_of(&words, false, 32);
+    let native = native_of(&MASK_OR_NUMBER, false, 32);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -529,4 +607,250 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// A console wave32 pixel shader run on a GPU that launches pixel shaders in
+/// 64-lane waves (AMD RDNA). Each 32-lane half must keep its own lane index
+/// (`v_mbcnt_lo`), ballot (`s_ff1`), lane read (`v_readlane_b32`) and
+/// first-lane read (`v_readfirstlane_b32`), so upper-half lanes 32..63 never
+/// read from lanes 0..31.
+#[test]
+fn wave32_pixel_shader_runs_as_32_lane_halves_on_wave64_hosts() {
+    use super::container::SigElement;
+    use super::host::Draw;
+    let words: [u32; 22] = [
+        // v0 = SV_Position.x, v1 = SV_Position.y -> v4 = y * 16 + x (0..255)
+        0x7E04_0F00, // v_cvt_u32_f32 v2, v0
+        0x7E06_0F01, // v_cvt_u32_f32 v3, v1
+        0x3406_0684, // v_lshlrev_b32 v3, 4, v3
+        0x3808_0702, // v_or_b32 v4, v2, v3
+        // v5 = v_mbcnt_lo_u32_b32(-1, 0): console lane within its 32-lane wave
+        0xD765_0005,
+        0x0001_00C1,
+        // s0 = s_ff1_i32_b32(ballot(v5 == 7)), s1 = v_readlane_b32(v4, s0)
+        0x7D84_0A87, // v_cmp_eq_u32 vcc_lo, 7, v5
+        0xBE80_136A, // s_ff1_i32_b32 s0, vcc_lo
+        0xD760_0001,
+        0x0000_0104, // v_readlane_b32 s1, v4, s0
+        // narrow EXEC to v5 >= 3, then s3 = v_readfirstlane_b32(v4)
+        0x7D86_0A83, // v_cmp_le_u32 vcc_lo, 3, v5
+        0xBE82_3C6A, // s_and_saveexec_b32 s2, vcc_lo
+        0x7E06_0504, // v_readfirstlane_b32 s3, v4
+        0xBEFE_0302, // s_mov_b32 exec_lo, s2
+        // Export (my_lane, picked_lane7, first_ge3, pix_id) as floats to mrt0
+        0x7E0C_0D05, // v_cvt_f32_u32 v6, v5
+        0x7E0E_0C01, // v_cvt_f32_u32 v7, s1
+        0x7E10_0C03, // v_cvt_f32_u32 v8, s3
+        0x7E12_0D04, // v_cvt_f32_u32 v9, v4
+        0xF800_080F,
+        0x0908_0706, // exp mrt0 v6, v7, v8, v9 done
+        S_ENDPGM,
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: (1 << 8) | (1 << 9),
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words[..21].iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let pos = SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0x3,
+        half: false,
+    };
+    let target = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    };
+    let lowered = lower::lower(&lower::Parts {
+        gs: None,
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![pos],
+        outputs: vec![target],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let ps = HostShader {
+        dispatch_x_one: false,
+        stage: HwStage::Ps,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: vec![],
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: vec![],
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = ps.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let vs = {
+        // Full-screen triangle from SV_VertexID (v0 = 0, 1, 2):
+        // (-1,-1,0,1), (3,-1,0,1), (-1,3,0,1).
+        let vs_words: [u32; 13] = [
+            0x3602_0081, // v_and_b32 v1, 1, v0
+            0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+            0x7E02_0D01, // v_cvt_f32_u32 v1, v1
+            0x0602_02F3, // v_add_f32 v1, -1.0, v1
+            0x3604_0082, // v_and_b32 v2, 2, v0
+            0x3404_0481, // v_lshlrev_b32 v2, 1, v2
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x0604_04F3, // v_add_f32 v2, -1.0, v2
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_02F2, // v_mov_b32 v4, 1.0
+            0xF800_08CF,
+            0x0403_0201, // exp pos0 v1, v2, v3, v4 done
+            S_ENDPGM,
+        ];
+        let vn = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: vec![],
+                outputs: vec![],
+            },
+            code: vs_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let vp = ir::build(&vn.code, vn.wave64, vn.vgprs).expect("vs ir::build");
+        let vst = structure::structure(&vp).expect("vs structure");
+        let vres = resource::track(&vp, &vn.layout, vn.stage, Some(&vst)).expect("vs track");
+        let vio = io::raise(&vp, &vn).expect("vs io::raise");
+        let vpos = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let vl = lower::lower(&lower::Parts {
+            gs: None,
+            native: &vn,
+            p: &vp,
+            st: &vst,
+            io: &vio,
+            res: &vres,
+            inputs: vec![],
+            outputs: vec![vpos],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("vs lower");
+        HostShader {
+            dispatch_x_one: false,
+            stage: HwStage::Vs,
+            dxil: vl.dxil,
+            user_data: vl.user_data,
+            samplers: vl.samplers,
+            static_samplers: vec![],
+            root_cbvs: vl.root_cbvs,
+            root_srvs: vl.root_srvs,
+            root_uavs: vl.root_uavs,
+            root_indexed_views: vec![],
+        }
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = host.pipeline(&vs, &ps).expect("graphics pipeline");
+    let pixels = host
+        .draw(
+            &root,
+            &pso,
+            &Draw {
+                roots: vec![],
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (16, 16),
+                mesh_groups: 0,
+            },
+        )
+        .expect("draw");
+    assert_eq!(pixels.len(), 256);
+    let mut lane7_seen = HashSet::new();
+    let mut lane3_seen = HashSet::new();
+    for (idx, px) in pixels.iter().enumerate() {
+        let my_lane = px[0] as u32;
+        let picked7 = px[1] as u32;
+        let first_ge3 = px[2] as u32;
+        let pix_id = px[3] as u32;
+        assert_eq!(pix_id, idx as u32, "pixel {idx} id");
+        assert!(
+            my_lane < 32,
+            "pixel {idx}: v_mbcnt_lo gave lane {my_lane} >= 32 (upper half of a 64-lane host wave?)"
+        );
+        if my_lane == 7 {
+            assert_eq!(
+                picked7, pix_id,
+                "pixel {idx} (lane 7): v_readlane_b32 read {picked7} instead of own half's {pix_id}"
+            );
+            lane7_seen.insert(picked7);
+        }
+        if my_lane == 3 {
+            assert_eq!(
+                first_ge3, pix_id,
+                "pixel {idx} (lane 3): v_readfirstlane_b32 read {first_ge3} instead of own half's {pix_id}"
+            );
+            lane3_seen.insert(first_ge3);
+        }
+    }
+    assert!(
+        lane7_seen.len() >= 8,
+        "expected >= 8 distinct 32-lane half-waves for 256 pixels, saw {}",
+        lane7_seen.len()
+    );
+    assert!(
+        lane3_seen.len() >= 8,
+        "expected >= 8 distinct 32-lane half-waves for v_readfirstlane, saw {}",
+        lane3_seen.len()
+    );
+    eprintln!(
+        "ran on the hardware device: {} distinct 32-lane halves across 256 pixels",
+        lane7_seen.len()
+    );
 }

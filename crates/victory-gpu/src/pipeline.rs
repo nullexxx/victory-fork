@@ -61,6 +61,9 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its result gets the least indirect light ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// Whether its code walks the ray-tracing structures, once looked at
@@ -71,7 +74,50 @@ pub(crate) struct Shader {
 
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.stage, self.hash)
+        write!(f, "{} {}", self.stage, self.hash)?;
+        match program_name(&self.container) {
+            Some(name) => write!(f, " {name}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Flamingo: the program's name as its container spells it (the first
+/// `XX_Name`: `CS_...`, `PS_...`), for the log lines that say a shader or
+/// pipeline failed: a hash alone says nothing about what goes missing.
+fn program_name(container: &[u8]) -> Option<&str> {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i + 3 < container.len() {
+        let w = &container[i..];
+        let starts = w[0].is_ascii_uppercase()
+            && w[1].is_ascii_uppercase()
+            && w[2] == b'_'
+            && (i == 0 || !ident(container[i - 1]));
+        if starts {
+            let len = w.iter().take_while(|&&b| ident(b)).count();
+            if len >= 6 {
+                return std::str::from_utf8(&w[..len]).ok();
+            }
+            i += len.max(1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::program_name;
+
+    #[test]
+    fn a_container_names_its_program() {
+        let mut bytes = b"\x00\x01DXBC..xCS_ignored".to_vec();
+        bytes.extend_from_slice(b"\x00CS_ShadowRenderTiled_9a1b\x00PS_Other\x00");
+        assert_eq!(program_name(&bytes), Some("CS_ShadowRenderTiled_9a1b"));
+        assert_eq!(program_name(b"\x00AB_x\x00"), None);
+        assert_eq!(program_name(b""), None);
     }
 }
 
@@ -116,6 +162,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
+                resolves_light: bytes
+                    .windows(crate::ambient::PROGRAM.len())
+                    .any(|w| w == crate::ambient::PROGRAM),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 walks: OnceLock::new(),
@@ -132,12 +182,20 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to title memory by address ([`stores_by_address`]):
+    /// only then are the host's copies of that memory compared after it.
+    pub(crate) address_stores: bool,
 }
 
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
+    /// The console shader container.
+    pub(crate) fn container(&self) -> &[u8] {
+        &self.container
+    }
+
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
@@ -157,6 +215,15 @@ impl Shader {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Flamingo diagnostics: `FLAMINGO_SAVE_FAILED=<dir>`: each shader that does not
+                // translate, as the title gave it (`<hash>.<stage>.cdxil`), for `translate`
+                if done.is_err()
+                    && let Some(dir) = std::env::var_os("FLAMINGO_SAVE_FAILED")
+                {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join(format!("{}.{}.cdxil", self.hash, self.stage)), &self.container);
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -168,6 +235,7 @@ impl Shader {
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
+                        name = program_name(&self.container).unwrap_or("?"),
                         error = %e,
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
@@ -180,16 +248,17 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
+    let programs = match victory_shader::program_part(&c) {
+        Some(part) => victory_shader::native_programs(part).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let address_stores = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -200,7 +269,79 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        address_stores,
+    })
+}
+
+/// The vertex and geometry shaders of a pipeline with a geometry stage: the
+/// title's "vertex" container is the ES half of a merged ES+GS stage and its
+/// "geometry" container the GS half, so the two are translated together
+/// (`victory_shader::emit::translate_merged_gs`) into a host vertex shader
+/// and a host geometry shader. Each is a [`Shader`] with its translation
+/// already made.
+///
+/// Kept by the two containers' hashes, not by the cache of single
+/// translations: two pipelines that share a geometry container with other
+/// ES containers (other records, other user data) are two pairs.
+/// shortcut: in memory only, a pair is translated again at each start.
+#[cfg(windows)]
+pub(crate) fn merged_pair(es: &Shader, gs: &Shader) -> Result<(Arc<Shader>, Arc<Shader>), String> {
+    type Pair = Result<(Arc<Shader>, Arc<Shader>), String>;
+    static PAIRS: Mutex<Option<HashMap<(String, String), Pair>>> = Mutex::new(None);
+    let key = (es.hash.clone(), gs.hash.clone());
+    let lookup = |pairs: &Mutex<Option<HashMap<(String, String), Pair>>>| {
+        pairs.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).cloned())
+    };
+    if let Some(done) = lookup(&PAIRS) {
+        return done;
+    }
+    // (the translation depends on it, as for a single shader)
+    crate::descriptor::host::probe_view_limit();
+    let made = victory_shader::emit::translate_merged_gs(&es.container, &gs.container)
+        .map_err(|e| e.to_string())
+        .map(|m| {
+            let hash = format!("{}+{}", es.hash, gs.hash);
+            let shader = |stage, host, native: &victory_shader::NativeProgram| {
+                let translated = OnceLock::new();
+                let _ = translated.set(Some(Translated {
+                    host,
+                    used: native.used.clone(),
+                    stores: stores(native),
+                    address_stores: stores_by_address(native),
+                }));
+                Arc::new(Shader {
+                    stage,
+                    hash: hash.clone(),
+                    container: Vec::new(),
+                    resolves_light: false,
+                    walks: OnceLock::new(),
+                    translated,
+                })
+            };
+            (
+                shader("vertex", m.vertex, &m.vertex_native),
+                shader("geometry", m.geometry, &m.geometry_native),
+            )
+        });
+    match &made {
+        Ok(_) => tracing::info!(es = %es.hash, gs = %gs.hash, "geometry stage translated"),
+        Err(e) => tracing::warn!(
+            es = %es.hash,
+            gs = %gs.hash,
+            error = %e,
+            "geometry stage does not translate; its pipelines' draws are dropped"
+        ),
+    }
+    PAIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, made.clone());
+    made
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -269,6 +410,8 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+#[cfg(windows)]
+pub(crate) use make::frame_drew;
 #[cfg(windows)]
 impl Shader {
     /// Whether the program walks the ray-tracing structures: its code has
@@ -381,12 +524,14 @@ pub(crate) fn builder_runs() -> bool {
     if b.whole {
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
+    let unmade: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::names(p)).collect();
+    let missing = unmade.len();
     if missing > 0 {
         b.off = true;
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
+            unmade = ?unmade,
             "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
         );
         return false;
@@ -420,6 +565,32 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Smem
             | Encoding::Flat
             | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store to title memory by address
+/// (`crate::memory`): a flat, global or scalar-memory store or atomic (the
+/// accesses that take a raw address), or code that is not all known, as in
+/// [`stores`]. The programs that walk the ray-tracing structures read them
+/// by address and store their results through views: before this, each of
+/// their dispatches declared every numbered copy of title memory written,
+/// which with the structure builder running was 12 GB snapshotted and
+/// compared on the CPU a frame (3030 ranges of 4 MiB).
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Smem | Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
@@ -737,10 +908,21 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if at.checked_add(size).is_none_or(|end| end > desc.size) {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                total = desc.size,
+                "truncated pipeline subobject; the rest is ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: `at + size <= desc.size`, and a shader subobject is 24 bytes
+            // with `Bytecode` at +8.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -749,6 +931,8 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    #[cfg(windows)]
+    graphics.integer_targets_unblended();
     hand_out(
         shaders,
         #[cfg(windows)]
@@ -933,6 +1117,65 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
+        }
+    }
+
+    #[test]
+    fn truncated_and_unaligned_streams_do_not_read_out_of_bounds() {
+        // 1. Unaligned stream holding a complete 24-byte VS subobject (kind = 1).
+        let vs = [7u8; 6];
+        let mut backing = [0u8; 25];
+        let slice = &mut backing[1..25]; // intentionally misaligned by 1 byte
+        slice[0..4].copy_from_slice(&1u32.to_le_bytes());
+        slice[8..16].copy_from_slice(&(vs.as_ptr() as u64).to_le_bytes());
+        slice[16..24].copy_from_slice(&(vs.len() as u64).to_le_bytes());
+        let desc = StreamDesc {
+            size: slice.len(),
+            stream: slice.as_ptr(),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        assert_eq!(shaders(p), [("vertex", vs.to_vec())]);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+
+        // 2. Truncated 336-byte blend subobject (kind = 8) placed flush against a
+        // PAGE_NOACCESS guard page: must not fault reading past `desc.size`.
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Memory::*;
+            // SAFETY: private two-page reservation with the second page inaccessible.
+            unsafe {
+                let base = VirtualAlloc(
+                    std::ptr::null(),
+                    0x2000,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+                .cast::<u8>();
+                assert!(!base.is_null());
+                let mut old = 0;
+                assert_ne!(
+                    VirtualProtect(base.add(0x1000).cast(), 0x1000, PAGE_NOACCESS, &mut old),
+                    0
+                );
+                let tail = base.add(0x1000 - 12);
+                tail.cast::<u32>().write_unaligned(8); // D3D12_BLEND_DESC (336 bytes)
+                let trunc = StreamDesc {
+                    size: 12,
+                    stream: tail,
+                };
+                let mut q = std::ptr::null();
+                assert_eq!(
+                    create_stream(std::ptr::null(), &trunc, &PIPELINE_IIDS[0], &mut q),
+                    S_OK
+                );
+                assert!(shaders(q).is_empty());
+                assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+                assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            }
         }
     }
 }

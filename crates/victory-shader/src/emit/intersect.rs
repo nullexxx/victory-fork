@@ -95,6 +95,22 @@ impl<'a> Lower<'a> {
             return Err("a ray-tracing node test's result");
         };
         let site = (b, i);
+        // Flamingo (`FLAMINGO_BVH_MISS=1`): every node test misses, for runs
+        // without the structure builder (`VICTORY_BVH_BUILDER` off). The
+        // title's structures are then never built, and its tracing programs
+        // read whatever title memory holds there: zeros read as a triangle at
+        // the origin, so rays came back hit and the light that needs them
+        // (bounce light, shadows of lamps and sky) came out black. A miss in
+        // every dword works for both node kinds: a box node with four
+        // invalid children, a triangle whose distance is a NaN.
+        if bvh_miss() {
+            let guard = self.guard(b, i)?;
+            let none = self.s.m.i32(u32::MAX);
+            for k in 0..4 {
+                self.write(inst, Reg::V(dst + k as u8), none, guard);
+            }
+            return Ok(());
+        }
         let nodes = self
             .x
             .res
@@ -403,6 +419,10 @@ impl<'a> Lower<'a> {
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
+            // An absent child (NONE) must never receive a finite sort key,
+            // even if its stored bounds pass the slab test.
+            let present = self.s.m.cmp(c, pred::IULT, children[n], none);
+            let hit = self.s.m.bin(c, Bin::And, hit, present);
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }
@@ -554,4 +574,11 @@ impl<'a> Lower<'a> {
             self.as_int(f)
         })
     }
+}
+
+/// Whether every ray-tracing node test misses (`FLAMINGO_BVH_MISS=1`; see
+/// [`Lower::bvh`]).
+fn bvh_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLAMINGO_BVH_MISS").is_some_and(|v| v == "1"))
 }

@@ -82,12 +82,14 @@
 
 mod bitcode;
 mod container;
+pub(crate) mod gs;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+pub mod stand_in;
 mod lower;
 mod own_bits;
 mod rect;
@@ -113,8 +115,8 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -246,6 +248,8 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,
+    /// A nonempty compute dispatch must have exactly one X group.
+    pub dispatch_x_one: bool,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -295,6 +299,13 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// What [`emit`] reports for a geometry program (the GS half of a merged
+/// ES+GS stage, [`crate::merged`]): everything before emission handles it,
+/// but a geometry program alone is not emitted: its input vertices and the
+/// runtime table come from the ES half, so only a pair is
+/// ([`translate_merged_gs`], `gs.rs`).
+pub const GS_EMIT: &str = "GS emit";
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -315,29 +326,194 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let part = crate::program_part(&c).ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(part)?
         .into_iter()
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
             )
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or geometry program",
         })?;
+    translate_native(&c, &native, false)
+}
+
+/// The two halves of a merged geometry stage, from the vertex container the
+/// ES program is in and the geometry container: paired
+/// ([`crate::merged::pair_es_gs`]), the ES half traced, raised and
+/// structured as the stage runs it (with the merged layout), and the record
+/// it writes matched with the vertex reads of the GS half
+/// ([`crate::handoff::handoff`]).
+pub fn merged_halves(
+    es: &[u8],
+    gs: &[u8],
+) -> Result<(crate::merged::MergedGs, crate::handoff::Handoff), ShaderError> {
+    let stage_of = |bytes: &[u8], stage| -> Result<NativeProgram, ShaderError> {
+        let c = Container::parse(bytes)?;
+        let dxil = c
+            .part(FourCC::DXIL)
+            .ok_or(ShaderError::Malformed("no DXIL part"))?;
+        crate::native_programs(dxil.data)?
+            .into_iter()
+            .find(|p| p.stage == stage)
+            .ok_or(ShaderError::Unsupported {
+                offset: 0,
+                what: "a container without the ES or GS program of a merged stage",
+            })
+    };
+    let merged = crate::merged::pair_es_gs(stage_of(es, HwStage::Es)?, stage_of(gs, HwStage::Gs)?)?;
+    let es_native = NativeProgram {
+        layout: merged.layout.clone(),
+        ..merged.es.clone()
+    };
+    let es_ir = crate::spill::build(&es_native)?;
+    let st = structure::structure(&es_ir);
+    resource::track_merged(&es_ir, &es_native.layout, es_native.stage, st.as_ref().ok())?;
+    io::raise(&es_ir, &es_native)?;
+    st?;
+    let gs_ir = crate::spill::build(&merged.gs)?;
+    let handoff = crate::handoff::handoff(&es_ir, &gs_ir)?;
+    Ok((merged, handoff))
+}
+
+/// The two host shaders of a merged geometry stage ([`translate_merged_gs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedShaders {
+    /// The ES half as a vertex shader: its outputs are the records it
+    /// writes, [`MergedShaders::record_dwords`] dwords of them, as
+    /// `TEXCOORD` registers of four 32-bit integers.
+    pub vertex: HostShader,
+    /// The geometry shader (triangles in, triangle strip out): its inputs are
+    /// the vertex shader's outputs, its outputs the geometry container's own.
+    pub geometry: HostShader,
+    pub record_dwords: u32,
+    /// The programs the two were made from, over the merged layout: what a
+    /// host pipeline needs of them besides the host code (the console
+    /// resources they read, whether they store).
+    pub vertex_native: NativeProgram,
+    pub geometry_native: NativeProgram,
+}
+
+/// Translates a geometry program with the ES program it is linked with: the
+/// pair is one merged stage ([`crate::merged`]), whose user SGPRs hold the
+/// root parameters of both ([`merged_halves`]), and comes out as a vertex
+/// shader and a geometry shader (`gs.rs`, with what it assumes).
+pub fn translate_merged_gs(es: &[u8], gs: &[u8]) -> Result<MergedShaders, ShaderError> {
+    let (merged, handoff) = merged_halves(es, gs)?;
+    let record = gs::record_signature(handoff.es.dwords);
+    // The ES half as a vertex shader.
+    let es_ir0 = crate::spill::build(&merged.es)?;
+    let es_native = gs::es_as_vertex_shader(&merged, &es_ir0, &handoff)?;
+    let es_ir = crate::spill::build(&es_native)?;
+    let st = structure::structure(&es_ir);
+    let res = resource::track_merged(&es_ir, &es_native.layout, es_native.stage, st.as_ref().ok())?;
+    let io = io::raise(&es_ir, &es_native)?;
+    let st = st?;
+    lower::take_needs();
+    let (vertex, _) = emit_program_with(
+        &Container::parse(es)?,
+        &es_native,
+        &es_ir,
+        &st,
+        &io,
+        &res,
+        Overrides {
+            inputs: Some(gs::vertex_id_input()),
+            outputs: Some(record.clone()),
+            gs: None,
+        },
+    )?;
+    // The GS half.
+    let gc = Container::parse(gs)?;
+    let native = merged.program();
     let p = crate::spill::build(&native)?;
+    let st = structure::structure(&p);
+    let res = resource::track_merged(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    let st = st?;
+    let outs = match gc.part(FourCC::OSG1) {
+        Some(part) => signature(part.data)?,
+        None => Vec::new(),
+    };
+    let plan = gs::plan(&p, &handoff, &outs)?;
+    lower::take_needs();
+    let (geometry, _) = emit_program_with(
+        &gc,
+        &native,
+        &p,
+        &st,
+        &io,
+        &res,
+        Overrides {
+            inputs: Some(record),
+            outputs: None,
+            gs: Some(plan),
+        },
+    )?;
+    Ok(MergedShaders {
+        vertex,
+        geometry,
+        record_dwords: handoff.es.dwords,
+        vertex_native: es_native,
+        geometry_native: native,
+    })
+}
+
+/// `merged`: the layout is the merged ES+GS stage's ([`resource::track_merged`]).
+fn translate_native(c: &Container, native: &NativeProgram, merged: bool) -> Result<HostShader, ShaderError> {
+    let p = crate::spill::build(native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let track = if merged { resource::track_merged } else { resource::track };
+    let res = track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit(c, native, &p, &st, &io, &res)
+}
+
+thread_local! {
+    /// [`with_wave_wide`]'s choice, for this thread's translations.
+    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the wave-wide form of a wave64 compute
+/// program on a host of 32-lane waves allowed, as `VICTORY_WAVE_WIDE=1`
+/// allows it for all: for programs known to come out of it right, while
+/// others stay off it (two programs that moved to it lost the card, runs
+/// 121-124). The form is still tried only after the exact ones, so a
+/// program that has one keeps it.
+pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = WAVE_WIDE_HERE.replace(on);
+    let out = f();
+    WAVE_WIDE_HERE.set(before);
+    out
+}
+
+thread_local! {
+    /// [`with_firstlane_own`]'s choice, for this thread's translations.
+    static FIRSTLANE_OWN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with a first-lane read where not every lane runs
+/// taken from the host wave's own first lane, as `VICTORY_FIRSTLANE_OWN=1`
+/// takes it for all: exact where the value is the same in every lane of the
+/// console wave, which holds for the programs it is asked for (the
+/// ray-tracing structure builder's scans, which read a sum of scalars).
+pub fn with_firstlane_own<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = FIRSTLANE_OWN_HERE.replace(on);
+    let out = f();
+    FIRSTLANE_OWN_HERE.set(before);
+    out
+}
+
+/// Whether [`with_firstlane_own`] asked for it on this thread.
+pub(super) fn firstlane_own_here() -> bool {
+    FIRSTLANE_OWN_HERE.get()
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -349,6 +525,12 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    if native.stage == HwStage::Gs {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: GS_EMIT,
+        });
+    }
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -422,7 +604,7 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WAVE_WIDE_HERE.get();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -499,6 +681,38 @@ pub fn emit(
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last of all (`VICTORY_WAVE_LDS_LOOSE=1` turns it on): LDS read and written inside
+        // one lane-branch region, ordered between the two host waves only where the region
+        // is entered and left (`lower::with_loose_lds`, approximate). A 32-lane host refuses
+        // the 64-lane form outright, which drops every dispatch of the program.
+        // Flamingo: off by default. In run 54 the three programs it let run
+        // made the world grainy and smeared (refused, their passes were left
+        // out and the picture was clean).
+        let loose_on = std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_some_and(|v| v == "1");
+        if loose_on && !strict {
+            let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
+            for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {
+                if let Some((p, st, io, res)) = f {
+                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+            report("loose LDS (APPROXIMATE)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+            if local_on && !exact_only {
+                let local = lower::with_loose_lds(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
+                report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
@@ -611,6 +825,27 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    emit_program_with(c, native, p, st, io, res, Overrides::default())
+}
+
+/// What a half of a merged stage takes in place of the container's: the
+/// signatures it declares and, for the geometry half, its plan.
+#[derive(Default)]
+struct Overrides {
+    inputs: Option<Vec<container::SigElement>>,
+    outputs: Option<Vec<container::SigElement>>,
+    gs: Option<gs::GsPlan>,
+}
+
+fn emit_program_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    over: Overrides,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -618,8 +853,14 @@ fn emit_program(
         }
     };
     let pixel = native.stage == HwStage::Ps;
-    let mut inputs = sig(FourCC::ISG1)?;
-    let mut outputs = sig(FourCC::OSG1)?;
+    let mut inputs = match over.inputs {
+        Some(i) => i,
+        None => sig(FourCC::ISG1)?,
+    };
+    let mut outputs = match over.outputs {
+        Some(o) => o,
+        None => sig(FourCC::OSG1)?,
+    };
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -678,10 +919,12 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        gs: over.gs,
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
+        dispatch_x_one: l.dispatch_x_one,
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -828,6 +1071,93 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    #[test]
+    fn lane_selectors_wrap_at_the_console_wave_width() {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+
+        let shader = |wave64, host, selector: u32| {
+            let width = if wave64 { 64 } else { 32 };
+            let lane = (128 + selector) << 9;
+            let words = [
+                0xBE85_0380u32, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                // An ordinary vector move prevents spill replacement and gives both shaders the
+                // same bitcode constant pool before the lane operations.
+                0x7E12_0200 | (128 + width), // v_mov_b32 v9, width
+                // Seed lane 32 in the constant pool even when testing selector 0 on wave64.
+                0xBE86_0380 | if wave64 { 32 } else { 5 }, // s_mov_b32 s6, payload
+                0xD761_0009,
+                lane | 6, // v_writelane_b32 v9, s6, selector
+                0xD760_0007,
+                lane | 0x109, // v_readlane_b32 s7, v9, selector
+                0x7E02_0207,  // v_mov_b32 v1, s7
+                0xE070_0000,
+                0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+                0xBF81_0000, // s_endpgm
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 16,
+                layout: vec![
+                    RootParam {
+                        root: RootType::Constants,
+                        table_offset_dwords: 0,
+                        sgprs: 4,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 4,
+                        slot: 1,
+                    },
+                ],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                }],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 5 << 1,
+                    threads: [if wave64 { 64 } else { 32 }, 1, 1],
+                }),
+                code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+            };
+            let bytes = crate::dxbc::build(&[]);
+            let container = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let was = lower::TEST_HOST_WAVE.replace(Some(host));
+            let result = emit(&container, &native, &p, &st, &io, &res);
+            lower::TEST_HOST_WAVE.set(was);
+            result.unwrap().dxil
+        };
+
+        for (wave64, host, width) in [(false, 32, 32), (true, 64, 64), (true, 32, 64)] {
+            assert!(
+                shader(wave64, host, width) == shader(wave64, host, 0),
+                "guest {width}, host {host}"
+            );
+        }
+        assert!(
+            shader(true, 32, 32) != shader(true, 32, 0),
+            "keep the wave64 upper half on a wave32 host"
+        );
+    }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
@@ -1067,6 +1397,7 @@ mod tests {
             return;
         };
         let ps = super::HostShader {
+            dispatch_x_one: false,
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
             user_data: Vec::new(),
@@ -1079,6 +1410,7 @@ mod tests {
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
+                dispatch_x_one: false,
                 stage,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
@@ -1126,6 +1458,184 @@ mod tests {
         let ours = c[4..20].to_vec();
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+    }
+
+    /// Triangle (0, 1, 2), each corner's 9-bit index in its 10-bit field.
+    const TRIANGLE: u32 = 1 << 10 | 2 << 20;
+    /// The edge flags of the three corners (bits 9, 19 and 29).
+    const EDGE_FLAGS: u32 = 1 << 9 | 1 << 19 | 1 << 29;
+    /// The culling bit.
+    const CULL: u32 = 1 << 31;
+
+    /// A one-wave (32-lane) triangle mesh program whose lanes all export
+    /// primitive `prim` and, as vertex `lane`, the position
+    /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
+    /// covers the whole target.
+    fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
+        let words = [
+            0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0x3604_0281, // v_and_b32 v2, 1, v1
+            0x3606_0282, // v_and_b32 v3, 2, v1
+            0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+            0x7E06_0D03, // v_cvt_f32_u32 v3, v3
+            0x1008_04F6, // v_mul_f32 v4, 4.0, v2
+            0x0608_08F3, // v_add_f32 v4, -1.0, v4
+            0x100A_06F4, // v_mul_f32 v5, 2.0, v3
+            0x060A_0AF3, // v_add_f32 v5, -1.0, v5
+            0x7E0C_02F0, // v_mov_b32 v6, 0.5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0x7E12_02FF, // v_mov_b32 v9, prim
+            prim,
+            0xF800_0941, // exp prim v9, off, off, off done
+            0x0000_0009,
+            0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+            0x0706_0504,
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 32,
+                max_primitives: 32,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = container::signature(&[position], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes)?;
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A primitive export's corners are 9-bit indices: the edge flag above
+    /// each (bits 9, 19, 29) is no part of it. Masking ten bits made a
+    /// flagged corner index 512 or more, past any mesh program's vertices
+    /// (the draw test below shows the triangle). Flagged, unflagged and
+    /// culled exports translate, and dxil.dll, where there is one, takes
+    /// each module.
+    #[test]
+    fn primitive_export_indices_drop_the_edge_flags() {
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for prim in [
+            TRIANGLE,
+            TRIANGLE | EDGE_FLAGS,
+            TRIANGLE | EDGE_FLAGS | CULL,
+        ] {
+            let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            #[cfg(windows)]
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut ms.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            }
+        }
+    }
+
+    /// A triangle mesh program on the host GPU and on WARP (where they have
+    /// mesh shaders): triangle (0, 1, 2) covers the target with its corners'
+    /// edge flags set as without them; with the culling bit, nothing is lit.
+    #[test]
+    #[cfg(windows)]
+    fn edge_flagged_triangles_draw_as_unflagged_ones() {
+        use super::host::{Draw, Host, Root};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ps = constant_color();
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+            // SAFETY: the query writes the structure of the given size.
+            let queried = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            };
+            if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+                eprintln!("no mesh shaders on the {label} device; skipped");
+                continue;
+            }
+            for (prim, culled) in [
+                (TRIANGLE, false),
+                (TRIANGLE | EDGE_FLAGS, false),
+                (TRIANGLE | EDGE_FLAGS | CULL, true),
+            ] {
+                let ms = triangle_mesh(prim).unwrap();
+                let root = host
+                    .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &ms.dxil, &ps)
+                    .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+                if culled {
+                    assert_eq!(lit, 0, "{label}, {prim:#x}: a culled triangle lit texels");
+                    continue;
+                }
+                assert!(
+                    texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                    "{label}, {prim:#x}: {lit} of 256 texels lit"
+                );
+            }
+            eprintln!("{label}: edge-flagged triangles drew");
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no device with mesh shaders; skipped");
+        }
     }
 
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
@@ -1356,6 +1866,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            gs: None,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -1368,6 +1879,7 @@ mod tests {
         #[cfg(windows)]
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
+                dispatch_x_one: false,
                 stage: super::HwStage::Cs,
                 dxil,
                 user_data: l.user_data,
@@ -1551,6 +2063,10 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with_input(words, input_addr, false)
+    }
+
+    fn pixel_with_input(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1564,7 +2080,7 @@ mod barycentric_tests {
                     mask: 0b1111,
                     attr: 0,
                     flat: false,
-                    fp16: false,
+                    fp16,
                     pack2: false,
                     row2: 0,
                 }],
@@ -1665,6 +2181,32 @@ mod barycentric_tests {
         assert_eq!(features & 0x2_0000, 0);
         assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
         validate(&shader);
+    }
+
+    #[test]
+    fn mixed_f16_write_preserves_the_first_interpolation_half() {
+        for mix in [0xCC21_0002, 0xCC22_0002] {
+            let words = [
+                0xD742_0002,
+                0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+                0xD75A_0003,
+                0x040A_0200, // v_interp_p2_f16 v3, v1, attr0.x, v2
+                mix,
+                0x03C9_E4F2, // v_fma_mixlo/hi_f16 v2, 1.0, 1.0, 1.0
+                0x7E08_1702, // v_cvt_f32_f16 v4, v2
+                0x2C0A_0490, // v_lshrrev_b32 v5, 16, v2
+                0x7E0C_1705, // v_cvt_f32_f16 v6, v5
+                0x7E0E_1703, // v_cvt_f32_f16 v7, v3
+                0xF800_180F,
+                0x0407_0604, // exp mrt0, v4, v6, v7, v4 done vm
+                S_ENDPGM,
+            ];
+            let shader = pixel_with_input(&words, PERSP_CENTER, true).unwrap();
+            let (_, inputs) = parts(&shader);
+            assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+            assert_eq!(texcoord_mode(&shader), 1);
+            validate(&shader);
+        }
     }
 
     /// Both: the attribute is interpolated and J is used as a value.
@@ -1782,5 +2324,108 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+}
+
+/// The geometry stage's first step: containers of the merged ES+GS stage
+/// (synthetic programs) get past tracing and I/O raising and stop at
+/// [`GS_EMIT`] in emission.
+#[cfg(test)]
+mod merged_gs_tests {
+    use super::*;
+    use crate::native::tests::container;
+
+    fn bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// `s_load_dword s0, s[<base>:<base + 1>], 0xb8`, then the end.
+    fn load(base: u32) -> Vec<u8> {
+        bytes(&[0xF400_0000 | base >> 1, 0xFA00_00B8, S_ENDPGM])
+    }
+
+    #[test]
+    fn a_geometry_container_alone_does_not_trace() {
+        // The load through the runtime table pointer (user data 0 and 1) is
+        // "an address in an SGPR that is no root parameter" until the ES
+        // half's layout says nothing is there.
+        let gs = container(&[(HwStage::Gs, &load(8))]);
+        assert!(matches!(
+            translate(&gs),
+            Err(ShaderError::Unsupported { what, .. })
+                if what == "an address in an SGPR that is no root parameter"
+        ));
+    }
+
+    /// The ES half of a pair: record of five dwords, then the handover.
+    fn es_half() -> Vec<u8> {
+        bytes(&crate::handoff::tests::es_words())
+    }
+
+    /// The GS half: reads of two vertices' records, then the load through
+    /// the runtime table.
+    fn gs_half() -> Vec<u8> {
+        let mut words = crate::handoff::tests::gs_words();
+        words.pop();
+        words.extend([0xF400_0004, 0xFA00_00B8, S_ENDPGM]);
+        bytes(&words)
+    }
+
+    #[test]
+    fn an_es_and_a_gs_container_pair_and_translate() {
+        let es = gs::tests::es_container();
+        let gs = gs::tests::gs_container(3);
+        let out = translate_merged_gs(&es, &gs).unwrap();
+        assert_eq!(out.record_dwords, 5);
+        let (_, h) = merged_halves(&es, &gs).unwrap();
+        assert_eq!((h.es.dwords, h.vertices), (5, 2));
+    }
+
+    #[test]
+    fn a_gs_half_without_output_records_is_refused_with_its_reason() {
+        let es = container(&[(HwStage::Es, &es_half()), (HwStage::Vs, &bytes(&[S_ENDPGM]))]);
+        let gs = container(&[(HwStage::Gs, &gs_half())]);
+        let r = translate_merged_gs(&es, &gs);
+        assert!(matches!(r, Err(ShaderError::Unsupported { what, .. })
+            if what == "a geometry program that emits no vertex"), "{r:?}");
+    }
+
+    #[test]
+    fn an_es_half_that_does_not_hand_over_stops_the_pair_before_the_gs_half() {
+        let es = container(&[(HwStage::Es, &bytes(&[S_ENDPGM]))]);
+        let gs = container(&[(HwStage::Gs, &gs_half())]);
+        let r = translate_merged_gs(&es, &gs);
+        assert!(matches!(r, Err(ShaderError::Unsupported { what, .. })
+            if what == "an ES half that does not hand over to the GS half"), "{r:?}");
+    }
+
+    #[test]
+    fn containers_that_are_not_an_es_and_a_gs_do_not_pair() {
+        let es = container(&[(HwStage::Es, &es_half())]);
+        let vs = container(&[(HwStage::Vs, &bytes(&[S_ENDPGM]))]);
+        let gs = container(&[(HwStage::Gs, &gs_half())]);
+        for (a, b) in [(&gs, &gs), (&vs, &gs), (&es, &vs), (&gs, &es)] {
+            assert!(translate_merged_gs(a, b).is_err(), "paired");
+        }
+    }
+
+    #[test]
+    fn other_unbound_pointers_still_fail_where_they_did() {
+        // Not the runtime table: user data 12 and 13 hold no parameter.
+        let gs = container(&[(HwStage::Gs, &load(20))]);
+        assert!(matches!(
+            translate(&gs),
+            Err(ShaderError::Unsupported { what, .. })
+                if what == "an address in an SGPR that is no root parameter"
+        ));
+        // The same load in the hardware VS, whose SGPR 8 is no parameter either.
+        let vs = container(&[(HwStage::Vs, &load(8))]);
+        assert!(matches!(
+            translate(&vs),
+            Err(ShaderError::Unsupported { what, .. })
+                if what == "an address in an SGPR that is no root parameter"
+        ));
     }
 }

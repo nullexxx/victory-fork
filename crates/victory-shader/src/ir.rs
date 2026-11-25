@@ -254,13 +254,19 @@ fn unspill(
     vgprs: u16,
 ) -> Vec<(usize, u8, u8)> {
     /// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
-    fn parked(inst: &gfx10::Instruction, fields: &Fields) -> Option<(bool, u8, u8, u32)> {
+    fn parked(
+        inst: &gfx10::Instruction,
+        fields: &Fields,
+        wave64: bool,
+    ) -> Option<(bool, u8, u8, u32)> {
         let Fields::Valu(v) = fields else { return None };
         if v.abs != 0 || v.neg != 0 || v.opsel != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() || v.dpp.is_some() {
             return None;
         }
         let lane = |op: &Operand| match *op {
-            Operand::Const(c @ 128..=191) => Some(u32::from(c) - 128),
+            Operand::Const(c @ 128..=191) => {
+                Some((u32::from(c) - 128) & gfx10::lane_selector_mask(wave64))
+            }
             _ => None,
         };
         match (inst.name()?, v.dst?, v.src.as_slice()) {
@@ -284,7 +290,7 @@ fn unspill(
     for inst in list.iter() {
         let Some(name) = inst.name() else { return Vec::new() };
         let fields = inst.fields(wave64);
-        let park = parked(inst, &fields);
+        let park = parked(inst, &fields, wave64);
         let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
             return Vec::new();
         };
@@ -1555,6 +1561,31 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    #[test]
+    fn wrapped_wave32_spill_overwrites_the_same_lane() {
+        let p = build_words(
+            &[
+                0xD761_0009,
+                0x0001_0401, // v_writelane_b32 v9, s1, 2
+                0xD761_0009,
+                0x0001_4402, // v_writelane_b32 v9, s2, 34
+                0xD760_0003,
+                0x0001_0509, // v_readlane_b32 s3, v9, 2
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [first, second, reload, _] = &p.blocks[0].insts[..] else {
+            panic!("expected two stores and one reload");
+        };
+        assert_eq!(
+            (first.name(), second.name(), reload.name()),
+            ("s_mov_b32", "s_mov_b32", "s_mov_b32")
+        );
+        assert_eq!(first.writes[0].0, second.writes[0].0);
+        assert_eq!(reload.reads[0].1, second.writes[0].1);
     }
 
     /// `if (v0 < s0) { ... }` whose body changes s6: `body` are its words, `after` what

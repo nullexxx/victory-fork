@@ -794,6 +794,17 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// Flamingo: locks for making slots' descriptors outside the slots' own
+/// lock ([`HostHeap::mirror`]), by slot number.
+static SLOT_STRIPES: [Mutex<()>; 256] = [const { Mutex::new(()) }; 256];
+
+/// Whether [`HostHeap::mirror`] makes descriptors outside the slots' lock
+/// (`FLAMINGO_MIRROR_UNLOCKED=0`: under it, as before).
+fn mirror_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLAMINGO_MIRROR_UNLOCKED").is_none_or(|v| v != "0"))
+}
+
 /// The size of every host view heap on a host that takes more than
 /// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
 /// views in the retail game) plus [`DYNAMIC`] fits with room to spare, and
@@ -932,7 +943,7 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_DWORDS) * 4;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -1602,6 +1613,17 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            // The title address of the buffer view, after the strides
+            // (`victory_shader::emit::SLOT_ADDRESSES`): low dword, then high.
+            let address = view
+                .and_then(buffer_range)
+                .map_or(0, |range| range.0);
+            // SAFETY: as above, two dwords inside the mapping.
+            unsafe {
+                let at = (*data as *mut u32).add((victory_shader::emit::SLOT_ADDRESSES + 2 * index) as usize);
+                at.write_volatile(address as u32);
+                at.add(1).write_volatile((address >> 32) as u32);
+            }
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
@@ -1779,7 +1801,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: cbv_size(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -1989,12 +2011,31 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
-            made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
-            } else {
-                make(&view, self.cpu(index))
-            };
+            let claim = if later { 0 } else { key };
+            made[index as usize] = claim;
+            if !mirror_unlocked() {
+                let kept = if later { None } else { make(&view, self.cpu(index)) };
+                if kept.is_none() && !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, kept.flatten());
+                return Some(view);
+            }
+            // Flamingo: the descriptor is made outside the slots' lock,
+            // which the recording threads take for their draws and the
+            // descriptor sync for every changed record (its driver calls
+            // under that lock: 7% of the submitting thread waiting, run 94).
+            // Under the lock of the slot's stripe, and only while the slot
+            // still holds this claim: a newer one makes its own after, so
+            // the slot ends with the newest view.
+            drop(made);
+            let _stripe = SLOT_STRIPES[index as usize % SLOT_STRIPES.len()]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != claim {
+                return Some(view);
+            }
+            let kept = if later { None } else { make(&view, self.cpu(index)) };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -2719,7 +2760,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: cbv_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -3586,6 +3627,16 @@ mod tests {
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
+}
+
+/// Largest constant buffer view D3D12 takes (4096 16-byte elements). A
+/// title view past it (a shader only reads its first 64 KiB) made an
+/// invalid view that removed NVIDIA's device (0x887A0001).
+const MAX_CBV_BYTES: u32 = 65_536;
+
+/// The host size of a constant buffer view of `size` bytes.
+fn cbv_size(size: u32) -> u32 {
+    size.next_multiple_of(256).min(MAX_CBV_BYTES)
 }
 
 #[cfg(test)]

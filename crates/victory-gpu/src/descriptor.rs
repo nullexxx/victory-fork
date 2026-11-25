@@ -28,10 +28,10 @@ const HEAP_IIDS: [Iid; 4] = [
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeapDesc {
-    kind: u32,
-    count: u32,
-    flags: u32,
-    nodes: u32,
+    pub(crate) kind: u32,
+    pub(crate) count: u32,
+    pub(crate) flags: u32,
+    pub(crate) nodes: u32,
 }
 
 /// Newer titles (the title) pass the description followed by
@@ -139,16 +139,44 @@ static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLo
 #[cfg(windows)]
 static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// An owned COM reference to a shader-visible [`Heap`], keeping it (and its
+/// host heap and backing memory) alive past the [`SHADER_HEAPS`] lookup.
+#[cfg(windows)]
+struct HeapRef(*const Heap);
+
+#[cfg(windows)]
+impl std::ops::Deref for HeapRef {
+    type Target = Heap;
+
+    fn deref(&self) -> &Heap {
+        // SAFETY: `HeapRef` retains a COM reference on the boxed `Heap`.
+        unsafe { &*self.0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HeapRef {
+    fn drop(&mut self) {
+        release(self.0.cast());
+    }
+}
+
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
-fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
+fn shader_slot(handle: u64) -> Option<(HeapRef, u32)> {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
-    // SAFETY: registered heaps are live (removed when dropped).
-    let heap = unsafe { &*(at as *const Heap) };
-    Some((heap, heap.index(handle)?))
+    if !object::try_add_ref(at as This) {
+        return None;
+    }
+    let heap = HeapRef(at as *const Heap);
+    let index = heap.index(handle);
+    // Drop the registry lock before `index?` can drop `heap` (which acquires
+    // `SHADER_HEAPS` if it happens to release the final reference).
+    drop(heaps);
+    Some((heap, index?))
 }
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
@@ -325,6 +353,10 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::forget_heap(host);
+        }
     }
 }
 
@@ -889,7 +921,58 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        note_forgotten(i);
     }
+}
+
+/// Table entries freed since the pass over the heap's buffer views last
+/// asked ([`take_forgotten`]): records that name them read nothing now,
+/// though no slot was written. Kept only once a pass has asked.
+static FORGOTTEN: std::sync::Mutex<(bool, bool, Vec<u32>)> = std::sync::Mutex::new((false, false, Vec::new()));
+
+/// More entries than this between two asks: the list is dropped, and the
+/// next ask is told it does not know.
+const FORGOTTEN_MOST: usize = 1 << 20;
+
+fn note_forgotten(i: u32) {
+    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (asked, overflowed, list) = &mut *forgotten;
+    if !*asked || *overflowed {
+        return;
+    }
+    if list.len() >= FORGOTTEN_MOST {
+        *overflowed = true;
+        *list = Vec::new();
+        return;
+    }
+    list.push(i);
+}
+
+/// The table entries freed since the last call (in any order, maybe
+/// twice); `None` on the first call and when too many were to be kept.
+pub(crate) fn take_forgotten() -> Option<Vec<u32>> {
+    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (asked, overflowed, list) = &mut *forgotten;
+    let known = *asked && !*overflowed;
+    *asked = true;
+    *overflowed = false;
+    let list = std::mem::take(list);
+    known.then_some(list)
+}
+
+/// The record at `handle` (a descriptor slot in title memory): its tag and
+/// two words, read as they are.
+pub(crate) fn record_at(handle: u64) -> [u32; 3] {
+    // SAFETY: the handle is a descriptor slot in title memory, at least 16
+    // bytes.
+    unsafe { (handle as *const [u32; 3]).read_unaligned() }
+}
+
+/// The view table entry a record names, if it names one (not a view named
+/// whole in its record, not a record of no view).
+pub(crate) fn record_entry(record: [u32; 3]) -> Option<u32> {
+    let [tag, i, generation] = record;
+    (tag == VIEW_TAG && generation >> KIND_SHIFT == 0).then_some(i)
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
@@ -1445,5 +1528,43 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shader_slot_retains_heap_across_title_release() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let start = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+
+        let (guard, index) = shader_slot(start + 32).expect("registered shader-visible heap");
+        assert_eq!(index, 1);
+
+        // Title drops its reference while `guard` is still held: heap must stay alive.
+        let rel = slot::<extern "system" fn(This) -> u32>(h, 0x10);
+        assert_eq!(rel(h), 1, "shader_slot guard must keep Heap alive");
+        // Backing memory remains mapped and readable/writable while `guard` is live.
+        // SAFETY: slot 1 lies inside the still-live 8-descriptor heap.
+        unsafe { ((start + 32) as *mut u32).write(0xCAFE_BABE) };
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((start + 32) as *const u32).read() }, 0xCAFE_BABE);
+
+        // Dropping the guard releases the final reference and unregisters the heap.
+        drop(guard);
+        assert!(shader_slot(start + 32).is_none());
+
+        // `try_add_ref` refuses to resurrect a zero-refcount object.
+        let dead = Object::new(&FUNCTIONS);
+        assert!(!object::try_add_ref(&raw const dead));
     }
 }
