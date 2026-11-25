@@ -94,6 +94,13 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+        /// Translate every shader found into the run's shader cache, so a
+        /// run translates none of them (the same as `--warm all`). Set the
+        /// switches the run sets that change translations
+        /// (`VICTORY_HOST_WAVE`, `VICTORY_VIEW_LIMIT`, `VICTORY_SHADER_OPT`):
+        /// they are part of each translation's key.
+        #[arg(long, conflicts_with = "warm")]
+        cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -163,7 +170,9 @@ fn main() -> Result<()> {
             list,
             jobs,
             warm,
+            cache,
         } => {
+            let warm = warm.or_else(|| cache.then(|| PathBuf::from("all")));
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
@@ -181,7 +190,7 @@ fn main() -> Result<()> {
             }
             #[cfg(not(windows))]
             {
-                let _ = (paths, validate, pipelines, list, jobs, warm);
+                let _ = (paths, validate, pipelines, list, jobs, warm, cache);
                 anyhow::bail!("translate checks shaders against the host's D3D12 and needs Windows")
             }
         }
