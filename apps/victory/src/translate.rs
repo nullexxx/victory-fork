@@ -238,7 +238,10 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(1000) {
-                                println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
+                                let line = format!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
+                                // Also to the log: under Wine or Proton stdout may go nowhere.
+                                tracing::info!("{line}");
+                                println!("{line}");
                             }
                             let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
                                 Ok(true) => 0,
@@ -255,11 +258,13 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
     let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
     let stopped = if counts[3].load(Ordering::Relaxed) > 0 { " (stopped at the time limit)" } else { "" };
-    println!(
+    let line = format!(
         "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads{stopped}",
         translated + there + failed,
         began.elapsed().as_secs_f64()
     );
+    tracing::info!("{line}");
+    println!("{line}");
     Ok(())
 }
 
