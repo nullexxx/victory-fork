@@ -152,6 +152,7 @@ static MADE: Mutex<Option<HashMap<(u32, i32, u32), Made>>> = Mutex::new(None);
 /// `height` pixels of `format` that `list` holds as a copy's destination.
 /// Nothing if the counter is off, no rate was measured yet, the format is
 /// not one of ours or the frame is too small for the box.
+#[allow(clippy::map_entry)] // the entry is made after an early return for a missing buffer
 pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, (width, height, format): (u32, u32, DXGI_FORMAT)) {
     if !on() {
         return;

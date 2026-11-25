@@ -1384,7 +1384,19 @@ mod tests {
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
             drop(placed);
             // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            // The host lets go of the pages a moment after the buffer is dropped
+            // (its heap is released by the runtime, not by `drop`): decommitting
+            // them at once fails now and then with ERROR_INVALID_PARAMETER when
+            // other tests keep the device busy. Try again for up to two seconds.
+            let mut freed = 0;
+            for _ in 0..200 {
+                freed = mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT);
+                if freed != 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_ne!(freed, 0, "decommit: {}", std::io::Error::last_os_error());
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
