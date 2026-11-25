@@ -7,6 +7,7 @@ mod census;
 #[cfg(windows)]
 mod discord;
 mod inspect;
+mod lowspec;
 mod run;
 mod shader;
 #[cfg(windows)]
@@ -114,9 +115,11 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
-        /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
-        console: Console,
+        /// The console model the title sees (device type, memory). Not
+        /// given: series-s on a PC with less than 24 GB of memory, else
+        /// series-x.
+        #[arg(long, value_enum)]
+        console: Option<Console>,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -201,7 +204,15 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let (console, why) = lowspec::console(console, lowspec::physical_memory());
+            let name = match console {
+                Console::SeriesX => "series-x",
+                Console::SeriesS => "series-s",
+            };
+            println!("console        {name} ({why})");
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }

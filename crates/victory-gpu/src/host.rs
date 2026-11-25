@@ -684,6 +684,9 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some((adapter, name)) = high_performance_adapter() {
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!(adapter = %name, "host device");
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -799,6 +802,38 @@ pub(crate) fn on_software_adapter(device: &ID3D12Device) -> bool {
         let software = d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == 0x1414;
         eprintln!("host adapter: {name} (vendor {:#x}, software {software})", d.VendorId);
         software
+    }
+}
+
+/// The first hardware adapter, in high-performance order, that makes a D3D12
+/// device, with its name. A laptop's default adapter (the one a null adapter
+/// means) is its integrated GPU unless the user set a per-app preference in
+/// Windows; this picks the discrete one. None when DXGI cannot order them.
+fn high_performance_adapter() -> Option<(IDXGIAdapter1, String)> {
+    // SAFETY: plain DXGI adapter queries; the probe device is dropped.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        (0..)
+            .map_while(|i| {
+                factory
+                    .EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                        i,
+                        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    )
+                    .ok()
+            })
+            .find_map(|adapter| {
+                let desc = adapter.GetDesc1().ok()?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                    || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
+                {
+                    return None;
+                }
+                let mut probe: Option<ID3D12Device> = None;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut probe).ok()?;
+                let name = String::from_utf16_lossy(&desc.Description);
+                Some((adapter, name.trim_end_matches('\0').to_owned()))
+            })
     }
 }
 
@@ -2152,6 +2187,46 @@ impl Deferred {
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
         self.uploads.push(buffer);
+    }
+
+    /// Empties the recording for the list's next use, keeping the capacity
+    /// of every collection (a reset is per submission, and the sets and
+    /// vectors grow back the same way every time). The same state
+    /// [`Deferred::default`] gives, so nothing leaks across resets: the
+    /// held uploads pass out of [`ALIVE`] as they would when dropped.
+    fn clear(&mut self) {
+        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // Every field by name (no `..`): one added later must be cleared
+        // here too. Flamingo's texture copy-backs were not, so every list
+        // reset kept them and the next submission did them all again (run
+        // 120: 119 ms a frame waiting for the card).
+        let Deferred {
+            copies,
+            uploads,
+            upload_bytes,
+            kept,
+            refreshed,
+            textures,
+            writes,
+            backs,
+            back_wanted,
+            texture_backs,
+            budget_zeroed,
+            indirect_readable,
+        } = self;
+        copies.clear();
+        uploads.clear();
+        *upload_bytes = 0;
+        kept.clear();
+        refreshed.clear();
+        textures.clear();
+        writes.clear();
+        backs.clear();
+        back_wanted.clear();
+        texture_backs.clear();
+        *budget_zeroed = false;
+        *indirect_readable = 0;
     }
 }
 
@@ -6369,7 +6444,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7968,6 +8043,17 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
         return true;
     }
     let mut done = 0;
+    if direct_writes() {
+        // SAFETY: the destination is mapped writable memory of `len` bytes;
+        // the kernel checks the source. A short or partial read returns a
+        // negative status (`STATUS_PARTIAL_COPY`), which leaves the piece
+        // walk in `read_pieces` to zero what cannot be read; `done == len`
+        // keeps that true of a success that is somehow short.
+        let status = unsafe {
+            NtReadVirtualMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done)
+        };
+        return status >= 0 && done == len;
+    }
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
@@ -7985,6 +8071,18 @@ unsafe extern "system" {
         size: usize,
         written: *mut usize,
     ) -> i32;
+
+    /// The kernel's read from a process's memory, `(process, address,
+    /// bytes, length, read out)`: an NTSTATUS, negative when a page of the
+    /// range is not there or not readable (`STATUS_PARTIAL_COPY` when only
+    /// part of it is). It changes no protection.
+    fn NtReadVirtualMemory(
+        process: *mut std::ffi::c_void,
+        base: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
+    ) -> i32;
 }
 
 /// Whether title memory is written with the kernel's own call
@@ -7992,7 +8090,9 @@ unsafe extern "system" {
 /// what the pages are (as `VirtualQuery` does: about 2 ms a call in the
 /// title's big pools, see [`copy_mapped`]): putting back what shaders wrote
 /// cost 1.2-1.9 s a frame for 430-800 pieces, 2 ms each whatever their size
-/// (run 24). On by default; `VICTORY_DIRECT_WRITES=0` writes as before.
+/// (run 24). The same switch reads with `NtReadVirtualMemory`, as
+/// `ReadProcessMemory` asks the same question. On by default;
+/// `VICTORY_DIRECT_WRITES=0` writes and reads as before.
 fn direct_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))

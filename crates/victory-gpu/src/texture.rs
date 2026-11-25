@@ -209,6 +209,80 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
+/// From this size on a texture's memory is hashed on several threads.
+const HASH_WIDE: usize = 1 << 20;
+
+/// The BLAKE3 hash of a texture's memory: the same hash as
+/// `blake3::hash`, on several threads from [`HASH_WIDE`] bytes on (BLAKE3
+/// hashes a tree of 1 KiB chunks, whichever thread hashes which part). One
+/// thread hashed about 4 GB/s here, 4 ms for 16 MB, at every check of a
+/// texture that changed or is hashed by turn.
+fn content_hash(bytes: &[u8]) -> blake3::Hash {
+    if bytes.len() < HASH_WIDE {
+        return blake3::hash(bytes);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_rayon(bytes);
+    hasher.finalize()
+}
+
+#[cfg(test)]
+mod content_hash_tests {
+    use super::{HASH_WIDE, content_hash};
+
+    /// The hash on several threads is `blake3::hash`, at sizes around the
+    /// switch and around chunk (1 KiB) and tree boundaries.
+    #[test]
+    fn the_wide_hash_is_the_hash() {
+        let data: Vec<u8> = (0..(HASH_WIDE * 9 + 4097))
+            .map(|i| (i * 131 + i / 977) as u8)
+            .collect();
+        for len in [
+            0,
+            1,
+            1024,
+            1025,
+            HASH_WIDE - 1,
+            HASH_WIDE,
+            HASH_WIDE + 1,
+            HASH_WIDE + 1024,
+            3 * HASH_WIDE + 7,
+            8 * HASH_WIDE,
+            data.len(),
+        ] {
+            assert_eq!(
+                content_hash(&data[..len]),
+                blake3::hash(&data[..len]),
+                "{len} bytes"
+            );
+        }
+    }
+
+    /// `cargo test --release -p victory-gpu --lib content_hash_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn content_hash_speed() {
+        for mb in [1usize, 4, 16] {
+            let data: Vec<u8> = (0..mb << 20).map(|i| (i * 31 + 7) as u8).collect();
+            let time = |f: &dyn Fn(&[u8]) -> blake3::Hash| {
+                let it = 200 / mb;
+                let start = std::time::Instant::now();
+                for _ in 0..it {
+                    std::hint::black_box(f(std::hint::black_box(&data)));
+                }
+                let s = start.elapsed().as_secs_f64();
+                ((it * data.len()) as f64 / s / 1e9, s * 1e3 / it as f64)
+            };
+            let (one, one_ms) = time(&|d| blake3::hash(d));
+            let (wide, wide_ms) = time(&|d| content_hash(d));
+            eprintln!(
+                "{mb} MB: one thread {one:.2} GB/s ({one_ms:.2} ms), content_hash {wide:.2} GB/s \
+                 ({wide_ms:.2} ms)"
+            );
+        }
+    }
+}
+
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
 /// ([`alias`]): every level of every layer as each of the two formats lays
@@ -1077,7 +1151,8 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        let since = last.asked;
+        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false, since)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1104,7 +1179,7 @@ impl Staging {
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true, since))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
@@ -1149,7 +1224,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = content_hash(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1170,7 +1245,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = content_hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1187,7 +1262,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = content_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1213,7 +1288,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = content_hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);

@@ -649,7 +649,7 @@ impl Lanes {
         for command in commands {
             let hold = !explicit
                 && match &command {
-                    Command::Read(r) => r.options & PAGE_DESTINATION != 0,
+                    Command::Read(r) => r.request.options & PAGE_DESTINATION != 0,
                     Command::Status(_) => !lane.held.is_empty(),
                 };
             if hold {
@@ -1834,13 +1834,13 @@ mod tests {
         l.submit_as(0, false);
         // Only the plain read starts; the status waits behind the held one.
         let plain = l.start().unwrap();
-        assert_eq!(plain.request.options, 0);
+        assert_eq!(plain.read.request.options, 0);
         assert!(l.start().is_none());
         l.finish(&plain, Ok(()));
         assert_eq!(l.lanes[&0].held.len(), 2);
         l.submit(0);
         let paged = l.start().unwrap();
-        assert_eq!(paged.request.options, PAGE_DESTINATION);
+        assert_eq!(paged.read.request.options, PAGE_DESTINATION);
         assert!(l.lanes[&0].held.is_empty());
         assert!(!l.lanes[&0].statuses.is_empty());
         l.finish(&paged, Ok(()));

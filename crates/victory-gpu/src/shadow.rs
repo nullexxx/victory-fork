@@ -3273,7 +3273,7 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, written)) = crate::watch::writes(a, e, true, self.oldest_taken(a, e)) else {
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3396,7 +3396,7 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some((now, written)) = crate::watch::writes(from, to, true, self.oldest_taken(from, to)) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
@@ -3480,6 +3480,20 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
+    /// Flamingo: the oldest asking at which the copy took a page of `[from,
+    /// to)` that it has taken (`u64::MAX` if none): a page written at or
+    /// before it is no news to the copy ([`crate::watch::writes`]'s `since`).
+    fn oldest_taken(&self, from: usize, to: usize) -> u64 {
+        let base = self.start as usize / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        (from / PAGE..to.div_ceil(PAGE))
+            .filter_map(|page| page.checked_sub(base).and_then(|i| copied.get(i)))
+            .filter(|&&at| at != 0)
+            .min()
+            .copied()
+            .unwrap_or(u64::MAX)
+    }
+
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());

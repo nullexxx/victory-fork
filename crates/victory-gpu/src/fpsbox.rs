@@ -10,8 +10,8 @@
 //! The text is drawn on the CPU with a font of its own (5 by 7 dots a
 //! glyph) into a buffer the card copies from; a buffer is made once for a
 //! text and never written again, so a present still in the air reads what
-//! it was recorded with. On by default; `VICTORY_FPS_COUNTER=0` leaves the
-//! frame as the title drew it.
+//! it was recorded with. Flamingo: off by default; `VICTORY_FPS_COUNTER=1`
+//! draws it.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -27,7 +27,9 @@ static TENTHS: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Whether the counter is drawn.
 fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FPS_COUNTER").is_none_or(|v| v != "0"))
+    // Flamingo: off unless asked for (`VICTORY_FPS_COUNTER=1`): the F9 overlay
+    // (`osd.rs`) shows the frame rate without touching the picture.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FPS_COUNTER").is_some_and(|v| v == "1"))
 }
 
 /// The frame rate just measured.
@@ -152,7 +154,6 @@ static MADE: Mutex<Option<HashMap<(u32, i32, u32), Made>>> = Mutex::new(None);
 /// `height` pixels of `format` that `list` holds as a copy's destination.
 /// Nothing if the counter is off, no rate was measured yet, the format is
 /// not one of ours or the frame is too small for the box.
-#[allow(clippy::map_entry)] // the entry is made after an early return for a missing buffer
 pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, (width, height, format): (u32, u32, DXGI_FORMAT)) {
     if !on() {
         return;
@@ -172,7 +173,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
         made.clear();
     }
     let key = (tenths, format.0, scale);
-    if !made.contains_key(&key) {
+    if let std::collections::hash_map::Entry::Vacant(slot) = made.entry(key) {
         let (w, h, lit) = bitmap(&text(tenths), scale);
         let pitch = (w as usize * bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT as usize);
         let Some((buffer, data)) = host.shared_buffer((pitch * h as usize) as u64) else {
@@ -186,7 +187,7 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
                 pixel(format, lit[y * w as usize + x], &mut out[at..at + bytes]);
             }
         }
-        made.insert(key, Made { buffer, width: w, height: h, pitch: pitch as u32 });
+        slot.insert(Made { buffer, width: w, height: h, pitch: pitch as u32 });
     }
     let Some(m) = made.get(&key) else {
         return;
