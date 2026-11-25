@@ -1,7 +1,8 @@
 //! `VICTORY_SHADER_SOURCE_HASH`: what the translator is built from (this
 //! crate's sources, manifest and build script, the workspace's lock file
 //! and the compiler's version), for caches of translations
-//! (`victory_shader::SOURCE_HASH`).
+//! (`victory_shader::SOURCE_HASH`); and the `VICTORY_*` switches it reads
+//! (`VICTORY_SHADER_SWITCHES`).
 
 use std::hash::{DefaultHasher, Hasher};
 use std::path::{Path, PathBuf};
@@ -21,14 +22,19 @@ fn main() {
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let version = std::process::Command::new(rustc).arg("-vV").output();
     h.write(&version.map(|o| o.stdout).unwrap_or_default());
+    let mut switches = std::collections::BTreeSet::new();
     for f in &files {
+        let text = std::fs::read(f).unwrap_or_default();
+        if f.extension().is_some_and(|x| x == "rs") {
+            switch_names(&String::from_utf8_lossy(&text), &mut switches);
+        }
         let name = f
             .strip_prefix(&dir)
             .unwrap_or(f)
             .to_string_lossy()
             .replace('\\', "/");
         h.write(name.as_bytes());
-        h.write(&std::fs::read(f).unwrap_or_default());
+        h.write(&text);
     }
     for watched in ["src", "Cargo.toml", "build.rs", "../../Cargo.lock"] {
         println!("cargo:rerun-if-changed={watched}");
@@ -37,6 +43,25 @@ fn main() {
         "cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={:016x}",
         h.finish()
     );
+    // Every `VICTORY_*` switch the translator reads: their values join the
+    // shader cache key at run time (`victory-gpu`'s `shader_cache`).
+    let joined: Vec<_> = switches.into_iter().collect();
+    println!("cargo:rustc-env=VICTORY_SHADER_SWITCHES={}", joined.join(","));
+}
+
+/// The names in `"VICTORY_..."` string literals of `text`.
+fn switch_names(text: &str, out: &mut std::collections::BTreeSet<String>) {
+    let mut rest = text;
+    while let Some(at) = rest.find("\"VICTORY_") {
+        let tail = &rest[at + 1..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(tail.len());
+        if tail[end..].starts_with('"') {
+            out.insert(tail[..end].to_string());
+        }
+        rest = &tail[end..];
+    }
 }
 
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
