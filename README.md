@@ -48,8 +48,8 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 changes that hold.** First rooms, about 3,850 draws a frame: 104 ms a frame
 (9.6 frames a second) with the set below, from about 120 ms in the
 morning. Still far from the console's 33 ms.
-- How the title paces itself (new meters in `fence.rs` and
-  `console_insn.rs`): it never asks for an event. Each frame begins with
+- How the title paces itself (new meters in `fence.rs` and the
+  since removed `console_insn.rs`): it never asks for an event. Each frame begins with
   one small submission and a signal, and a title thread then waits for
   that fence value by reading it in memory with `monitorx` / `mwaitx`
   (AMD-only: about 280,000 emulated exceptions a second on an Intel
