@@ -569,4 +569,36 @@ mod tests {
         assert_eq!(found.len(), 4);
         assert_eq!(found[1].name, Some("PS_a"));
     }
+
+    #[test]
+    fn handles_empty_and_rejects_mismatched_or_truncated_streams() {
+        let empty = record_bytes("CS_empty", 0x3c, &[]);
+        assert_eq!(records(&empty)[0].unpack(), Some(Vec::new()));
+
+        let payload: Vec<u8> = (0..16_384u32)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 5)) as u8)
+            .collect();
+        let good = record_bytes("PS_big", 0x32, &payload);
+        let r = records(&good)[0];
+        assert_eq!(r.unpack(), Some(payload.clone()));
+
+        // Oversized stream (declared unpacked_size smaller than actual output).
+        let mut smaller = good.clone();
+        smaller[r.offset + 8..r.offset + 12]
+            .copy_from_slice(&((payload.len() - 1) as u32).to_le_bytes());
+        assert_eq!(records(&smaller)[0].unpack(), None);
+
+        // Under-filled stream (declared unpacked_size larger than actual output).
+        let mut larger = good.clone();
+        larger[r.offset + 8..r.offset + 12]
+            .copy_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
+        assert_eq!(records(&larger)[0].unpack(), None);
+
+        // Truncated raw deflate stream.
+        let mut truncated = good[..good.len() - 1].to_vec();
+        let new_n = (truncated.len() - r.offset) as u32;
+        truncated[r.offset - 4..r.offset].copy_from_slice(&new_n.to_le_bytes());
+        truncated[r.offset + 4..r.offset + 8].copy_from_slice(&new_n.to_le_bytes());
+        assert_eq!(records(&truncated)[0].unpack(), None);
+    }
 }
