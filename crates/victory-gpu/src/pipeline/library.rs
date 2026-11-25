@@ -622,7 +622,12 @@ pub(crate) fn save(now: bool) {
                 USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
             match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
                 Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved (no host pipeline library)"),
-                Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
+                Err(e) => {
+                    // Kept dirty, so the next save tries again even when no
+                    // new pipeline is drawn with.
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                    tracing::warn!(error = %e, "early pipeline list not saved")
+                }
             }
         }
         return;
