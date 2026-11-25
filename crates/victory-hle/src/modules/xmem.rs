@@ -526,18 +526,21 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 /// pages (`map_logged`, `unmap`), and our views for writes into them
 /// (`View`): under Wine each is a wineserver request that walks every view
 /// of the process. Said in the log at every power of two from 1,024 on.
-static VIEW_CALLS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+static VIEW_CALLS: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
 const TITLE_MAPS: usize = 0;
 const TITLE_UNMAPS: usize = 1;
 const OWN_MAPS: usize = 2;
 const WHOLE_WINDOWS: usize = 3;
+/// Mappings asked for that the addresses already showed: left as they are.
+const ALREADY_SHOWN: usize = 4;
 
 fn count_view_call(kind: usize, live: Option<usize>) {
     let n = VIEW_CALLS[kind].fetch_add(1, Ordering::Relaxed) + 1;
     if n >= 1024 && n.is_power_of_two() {
-        let [maps, unmaps, own, whole] = [0, 1, 2, 3].map(|k| VIEW_CALLS[k].load(Ordering::Relaxed));
+        let [maps, unmaps, own, whole, kept] = [0, 1, 2, 3, 4].map(|k| VIEW_CALLS[k].load(Ordering::Relaxed));
         tracing::info!(
             title_maps = maps,
+            remaps_already_shown = kept,
             title_unmaps = unmaps,
             own_views_mapped_and_unmapped = own,
             writes_through_whole_section_views = whole,
@@ -545,6 +548,17 @@ fn count_view_call(kind: usize, live: Option<usize>) {
             "physical page views so far (each map or unmap of a view is a wineserver request under Wine)"
         );
     }
+}
+
+/// The section and page index the title address `at` shows, if a view of
+/// ours is there.
+fn shown(physical: &Physical, at: usize) -> Option<(usize, usize)> {
+    physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + size)
+        .map(|(base, (_, s))| (Arc::as_ptr(&s.section) as usize, s.index + (at - base) / PAGE))
 }
 
 /// A view of our own on consecutive slices of one section, committed and
@@ -788,6 +802,23 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
+    // Pages the addresses show already: nothing to do. Titles map the same
+    // pages to the same place again and again while they stream; each map
+    // and unmap is a wineserver request under Wine that walks every view
+    // (100,000 of them in a cutscene).
+    if !pages.is_null() && n > 0 {
+        // SAFETY: the title passes `n` page numbers.
+        let wanted = unsafe { std::slice::from_raw_parts(pages, n) };
+        let same = wanted.iter().enumerate().all(|(i, page)| {
+            physical.pages.get(page).is_some_and(|s| {
+                shown(&physical, base + i * PAGE) == Some((Arc::as_ptr(&s.section) as usize, s.index))
+            })
+        });
+        if same {
+            count_view_call(ALREADY_SHOWN, None);
+            return address;
+        }
+    }
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
@@ -856,6 +887,17 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    // As in `XMemMapPhysicalPages`: what the addresses show already is left.
+    if from != 0
+        && len > 0
+        && (0..len.div_ceil(PAGE)).all(|k| {
+            let target = shown(&physical, from + k * PAGE);
+            target.is_some() && shown(&physical, to + k * PAGE) == target
+        })
+    {
+        count_view_call(ALREADY_SHOWN, None);
+        return true;
+    }
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
