@@ -8748,7 +8748,7 @@ impl Meter {
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
+                 dropped {dropped:.0} without a host pipeline ({making} being made, {finished} made since the last line) and \
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms ({picked_mode}: {picked_slots:.0} slots looked at {picked_look:.1} ms, \
                  {picked_copies:.0} copies refreshed {picked_refresh:.1} ms, textures {picked_tex:.1} ms);                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
@@ -8770,6 +8770,7 @@ impl Meter {
                     crate::resource::PLANES[2].load(Ordering::Relaxed)
                 ),
                 making = crate::pipeline::making(),
+                finished = crate::pipeline::take_finished(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );

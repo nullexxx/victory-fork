@@ -357,21 +357,44 @@ pub(crate) fn frame_drew(drawn: u64) {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// How many workers make host pipelines: half the logical processors, 2 to
+/// 8, or `VICTORY_PIPELINE_WORKERS=<n>` (1 to 64).
+fn pipeline_workers() -> usize {
+    std::env::var("VICTORY_PIPELINE_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, 64))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)))
+}
+
+/// Workers run below normal priority, under the title's own threads;
+/// `VICTORY_PIPELINE_PRIORITY=normal` leaves them at normal. Under Wine a
+/// lower priority is a higher nice value, and a title keeping every core
+/// busy can leave such workers almost no time: a run under Proton made about
+/// one pipeline a second in the world with 1,200 waiting.
+fn lower_priority() -> bool {
+    std::env::var("VICTORY_PIPELINE_PRIORITY").map_or(true, |v| !v.trim().eq_ignore_ascii_case("normal"))
+}
+
+/// Starts the workers on first use ([`pipeline_workers`]).
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = pipeline_workers();
+        let lower = lower_priority();
+        tracing::info!(workers, below_normal = lower, "host pipeline workers");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
                     // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    if lower {
+                        // SAFETY: a plain call on our own thread.
+                        unsafe {
+                            use windows::Win32::System::Threading::*;
+                            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
                     }
                     loop {
                         // All of them during the intro and the menus starve
@@ -380,6 +403,7 @@ fn workers() -> bool {
                             std::thread::sleep(Duration::from_millis(50));
                         }
                         next().make();
+                        FINISHED.fetch_add(1, Ordering::Relaxed);
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -396,6 +420,9 @@ fn workers() -> bool {
         running
     })
 }
+
+/// Pipelines the workers finished since the frame line last took them.
+pub(crate) static FINISHED: AtomicU64 = AtomicU64::new(0);
 
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);

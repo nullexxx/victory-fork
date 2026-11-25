@@ -689,6 +689,12 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Pipelines the workers finished since the last call.
+#[cfg(windows)]
+pub(crate) fn take_finished() -> u64 {
+    make::FINISHED.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Flamingo, for the stats overlay: pipelines made since the start and
 /// those without a host pipeline ([`make::made`]), and shaders that do not
 /// translate.
